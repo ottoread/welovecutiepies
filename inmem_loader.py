@@ -2234,6 +2234,126 @@ def install_optimizer_speedups(
     opt_pkg.optimize = fast_optimize
 
 
+def _decode_fast_plan_blob(blob: bytes, cls_map: dict[str, type], expr_base: type) -> Any:
+    plan_obj = pickle.loads(blob)
+    obj_new = object.__new__
+
+    def dec(obj):
+        if type(obj) is tuple and len(obj) == 6 and obj[0] == "_E":
+            node = obj_new(cls_map[obj[1]])
+            args = {}
+            for k, v in obj[2].items():
+                if type(v) is list:
+                    lst = [dec(x) for x in v]
+                    for i, ch in enumerate(lst):
+                        if isinstance(ch, expr_base):
+                            ch.parent = node
+                            ch.arg_key = k
+                            ch.index = i
+                    args[k] = lst
+                else:
+                    dv = dec(v)
+                    if isinstance(dv, expr_base):
+                        dv.parent = node
+                        dv.arg_key = k
+                        dv.index = None
+                    args[k] = dv
+            node.args = args
+            node.parent = None
+            node.arg_key = None
+            node.index = None
+            node.comments = obj[3]
+            node._type = dec(obj[4]) if obj[4] is not None else None
+            node._meta = obj[5]
+            node._hash = None
+            return node
+        if type(obj) is list:
+            return [dec(x) for x in obj]
+        if type(obj) is dict:
+            return {dec(k): dec(v) for k, v in obj.items()}
+        if type(obj) is tuple:
+            return tuple(dec(x) for x in obj)
+        return obj
+
+    seen_steps: set[int] = set()
+
+    def fix_step(st):
+        sid = id(st)
+        if sid in seen_steps:
+            return
+        seen_steps.add(sid)
+        for k, v in st.__dict__.items():
+            if k in ("dependencies", "dependents"):
+                for s in v:
+                    fix_step(s)
+            elif v is not None:
+                st.__dict__[k] = dec(v)
+
+    if getattr(plan_obj, "ctes", None) is not None:
+        plan_obj.ctes = dec(plan_obj.ctes)
+    fix_step(plan_obj.root)
+    return plan_obj
+
+
+def _install_executor_unit_plan_cache(te_mod) -> None:
+    """Bypass optimize() + Plan() for TestExecutor unit tests on pure_executor_only commits."""
+    cache_p = _APP_DIR / "executor_unit_plans.pkl"
+    if not cache_p.is_file():
+        return
+    try:
+        unit_plans: dict[str, bytes] = pickle.loads(cache_p.read_bytes())
+        if not unit_plans:
+            return
+        import sqlglot.executor as ex_pkg
+        from sqlglot import exp as _exp_m
+        from sqlglot.errors import ExecuteError
+        from sqlglot.executor.python import PythonExecutor
+        from sqlglot.executor.table import ensure_tables
+        from sqlglot.helper import dict_depth
+        from sqlglot.optimizer.annotate_types import annotate_types
+        from sqlglot.schema import ensure_schema, flatten_schema, nested_get, nested_set
+
+        cls_map = {c.__name__: c for c in _exp_m.EXPR_CLASSES.values()}
+        cls_map["Expr"] = _exp_m.Expr
+        expr_base = _exp_m.Expr
+        orig_execute = ex_pkg.execute
+
+        def fast_execute(sql, schema=None, dialect=None, tables=None):
+            if isinstance(sql, str):
+                tables_ = ensure_tables(tables, dialect=dialect)
+                sch = schema
+                if not sch:
+                    sch = {}
+                    flattened = flatten_schema(tables_.mapping, depth=dict_depth(tables_.mapping))
+                    for keys in flattened:
+                        tbl = nested_get(tables_.mapping, *zip(keys, keys))
+                        assert tbl is not None
+                        for column in tbl.columns:
+                            value = tbl[0][column]
+                            col_type = (
+                                annotate_types(_exp_m.convert(value), dialect=dialect).type
+                                or type(value).__name__
+                            )
+                            nested_set(sch, [*keys, column], col_type)
+                sch_obj = ensure_schema(sch, dialect=dialect)
+                if tables_.supported_table_args and tables_.supported_table_args != sch_obj.supported_table_args:
+                    raise ExecuteError("Tables must support the same table args as schema")
+                key = hashlib.sha256(
+                    f"{sql}\x00{repr(sch_obj.mapping)}\x00{dialect!r}".encode("utf-8")
+                ).hexdigest()[:16]
+                blob = unit_plans.get(key)
+                if blob is not None:
+                    plan = _decode_fast_plan_blob(blob, cls_map, expr_base)
+                    return PythonExecutor(tables=tables_).execute(plan)
+            return orig_execute(sql, schema=schema, dialect=dialect, tables=tables)
+
+        ex_pkg.execute = fast_execute
+        if hasattr(te_mod, "execute"):
+            te_mod.execute = fast_execute
+    except BaseException:
+        pass
+
+
 def run_test_in_process(
     test_id: str,
     loaded_classes: dict[tuple[str, str], Any],
@@ -2252,6 +2372,7 @@ def run_test_in_process(
     tpcds_pre_merge: dict[str, Any] | None = None,
     early_stage: int | None = None,
     allow_lambda_exec: bool = False,
+    pure_executor_only: bool = False,
     patched_files: dict[str, str | None] | None = None,
     is_tier0: bool = False,
 ) -> bool:
@@ -2427,6 +2548,8 @@ def run_test_in_process(
 
         elif file_path == "tests/test_executor.py" and cls_name == "TestExecutor":
             install_executor_speedups(patched_files or {}, allow_lambda_exec=allow_lambda_exec)
+            if pure_executor_only and "tests/test_executor.py" not in (patched_files or {}):
+                _install_executor_unit_plan_cache(mod)
             mod.ProcessPoolExecutor = lambda *a, **kw: _LazyInProcessPool(
                 check_pickle=serde_touched, **kw
             )

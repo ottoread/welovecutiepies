@@ -1045,3 +1045,92 @@ def diff_sql_fixtures(orig_text: str, new_text: str) -> list[str] | None:
     orig_set = set(orig_items)
     changed = [it for it in new_items if it not in orig_set]
     return changed if changed else None
+
+
+_IS_OP_PAIRS = {
+    (ast.Is, ast.Eq),
+    (ast.Eq, ast.Is),
+    (ast.IsNot, ast.NotEq),
+    (ast.NotEq, ast.IsNot),
+}
+_ORD_OP_PAIRS = {
+    (ast.Lt, ast.LtE),
+    (ast.LtE, ast.Lt),
+    (ast.Gt, ast.GtE),
+    (ast.GtE, ast.Gt),
+}
+_BOOL_OP_PAIRS = {
+    (ast.And, ast.Or),
+    (ast.Or, ast.And),
+}
+
+
+def detect_single_invariant_op_edit(orig_text: str, new_text: str) -> tuple[str, int, int] | None:
+    """If the ENTIRE file diff is swapping a single pure operator (`is`<->`==`, `<`<->`<=`, or `if A and/or B:`),
+    return `(kind, orig_lineno, orig_col_offset)` where kind in {'is', 'ord', 'bool'}. Otherwise None."""
+    try:
+        orig_ast = ast.parse(orig_text)
+        new_ast = ast.parse(new_text)
+    except SyntaxError:
+        return None
+
+    found: list[tuple[str, int, int]] = []
+    aborted = False
+
+    def _walk(o: object, n: object) -> None:
+        nonlocal aborted
+        if aborted:
+            return
+        if type(o) is not type(n):
+            aborted = True
+            return
+        if isinstance(o, ast.AST):
+            # Fast skip identical subtrees!
+            if ast.dump(o, include_attributes=False) == ast.dump(n, include_attributes=False):
+                return
+            if isinstance(o, ast.Compare) and len(o.ops) == 1 and len(n.ops) == 1:
+                pair = (type(o.ops[0]), type(n.ops[0]))
+                if (
+                    (pair in _IS_OP_PAIRS or pair in _ORD_OP_PAIRS)
+                    and ast.dump(o.left, include_attributes=False) == ast.dump(n.left, include_attributes=False)
+                    and ast.dump(o.comparators[0], include_attributes=False) == ast.dump(n.comparators[0], include_attributes=False)
+                ):
+                    kind = "is" if pair in _IS_OP_PAIRS else "ord"
+                    found.append((kind, o.lineno, o.col_offset))
+                    if len(found) > 1:
+                        aborted = True
+                    return
+            if (
+                isinstance(o, ast.If)
+                and isinstance(o.test, ast.BoolOp)
+                and isinstance(n.test, ast.BoolOp)
+                and len(o.test.values) == 2
+                and len(n.test.values) == 2
+                and (type(o.test.op), type(n.test.op)) in _BOOL_OP_PAIRS
+                and ast.dump(o.test.values[0], include_attributes=False) == ast.dump(n.test.values[0], include_attributes=False)
+                and ast.dump(o.test.values[1], include_attributes=False) == ast.dump(n.test.values[1], include_attributes=False)
+                and len(o.body) == len(n.body)
+                and len(o.orelse) == len(n.orelse)
+                and all(ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False) for a, b in zip(o.body, n.body))
+                and all(ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False) for a, b in zip(o.orelse, n.orelse))
+            ):
+                found.append(("bool", o.test.lineno, o.test.col_offset))
+                if len(found) > 1:
+                    aborted = True
+                return
+            for field in o._fields:
+                _walk(getattr(o, field), getattr(n, field))
+        elif isinstance(o, list):
+            if len(o) != len(n):
+                aborted = True
+                return
+            for a, b in zip(o, n):
+                _walk(a, b)
+        else:
+            if o != n:
+                aborted = True
+
+    _walk(orig_ast, new_ast)
+    if aborted or len(found) != 1:
+        return None
+    return found[0]

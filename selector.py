@@ -31,6 +31,7 @@ from inmem_loader import (
 from patch_utils import (
     analyze_python_edit,
     apply_file_patch,
+    detect_single_invariant_op_edit,
     diff_sql_fixture_pairs,
     diff_sql_fixtures,
     has_only_shadowed_metadata_inserts,
@@ -47,6 +48,7 @@ APP_DIR = Path(__file__).resolve().parent
 MAPS_PATH = APP_DIR / "maps.zlib"
 FIXTURE_COV_PATH = APP_DIR / "fixture_cov.zlib"
 VALIDATOR_COV_PATH = APP_DIR / "validator_cov.zlib"
+INVARIANTS_PATH = APP_DIR / "invariants.zlib"
 OPT_STAGES_PATH = APP_DIR / "opt_stages.zlib"
 
 DEFAULT_CORE_FILES = {
@@ -266,7 +268,7 @@ def _execute_job_in_child(
         and tpcds_fast is not None
         and not tpcds_fast["executor_touched"]
         and "sqlglot/optimizer/optimizer.py" not in patched_files
-        and (fixture_index_masks is not None or early_stage is not None or opt_dialect_filter is not None)
+        and job.get("allow_share_tpcds", False)
     )
     if share_tpcds:
         try:
@@ -443,6 +445,7 @@ def _execute_job_in_child(
                 tpcds_pre_merge=tpcds_pre_merge,
                 early_stage=early_stage,
                 allow_lambda_exec=allow_lambda_exec,
+                pure_executor_only=job.get("pure_executor_only", False),
                 patched_files=patched_files,
                 is_tier0=is_tier0,
             ):
@@ -684,6 +687,25 @@ class BlastRadiusSelector:
         self._vcall_expr_cache: dict[str, dict[int, int]] | None = None
         self._opt_stages_loaded = False
         self._rule_line_masks: dict[str, dict[int, int]] = {}
+        self._invariants_loaded = False
+        self._inv_sites: dict[str, dict[tuple[str, int, int], set[int]]] = {
+            "is": {},
+            "ord": {},
+            "bool": {},
+        }
+        self._dtype_to_tests: dict[str, set[int]] = {}
+
+        # Unique short-name lookup for exp.<Name> -> "sqlglot.expressions.<mod>:<Name>"
+        _short_counts: dict[str, int] = {}
+        _short_map: dict[str, str] = {}
+        for fc in self.expr_to_tests:
+            if fc.startswith("sqlglot.expressions."):
+                sn = fc.split(":", 1)[1]
+                _short_counts[sn] = _short_counts.get(sn, 0) + 1
+                _short_map[sn] = fc
+        self._expr_short_to_full: dict[str, str] = {
+            sn: fc for sn, fc in _short_map.items() if _short_counts[sn] == 1
+        }
 
         self.mod_to_dialect_tests: dict[str, set[int]] = {}
         for dkey, tnums in self.dialect_to_tests.items():
@@ -752,6 +774,33 @@ class BlastRadiusSelector:
         if OPT_STAGES_PATH.is_file():
             st = pickle.loads(zlib.decompress(OPT_STAGES_PATH.read_bytes()))
             self._rule_line_masks = st.get("rule_line_masks", {})
+
+    def _ensure_invariants(self) -> None:
+        if self._invariants_loaded:
+            return
+        self._invariants_loaded = True
+        if INVARIANTS_PATH.is_file():
+            inv = pickle.loads(zlib.decompress(INVARIANTS_PATH.read_bytes()))
+            inv_tids: list[str] = inv.get("test_ids", [])
+            idx_to_num = [self.by_id.get(tid) for tid in inv_tids]
+            for kind, key_name in (("is", "is_sites"), ("ord", "ord_sites"), ("bool", "bool_sites")):
+                raw_map = inv.get(key_name, {})
+                mapped: dict[tuple[str, int, int], set[int]] = {}
+                for site_k, idxs in raw_map.items():
+                    s: set[int] = set()
+                    for idx in idxs:
+                        tn = idx_to_num[idx]
+                        if tn is not None:
+                            s.add(tn)
+                    mapped[site_k] = s
+                self._inv_sites[kind] = mapped
+            for dt_name, idxs in inv.get("dtype_to_tests", {}).items():
+                s = set()
+                for idx in idxs:
+                    tn = idx_to_num[idx]
+                    if tn is not None:
+                        s.add(tn)
+                self._dtype_to_tests[dt_name] = s
 
     def _tpcds_coverage(self) -> dict[int, int]:
         if self._tpcds_optimizer_cover is None:
@@ -865,6 +914,10 @@ class BlastRadiusSelector:
         has_binary_change = False
         can_hot_patch = True
         hot_patch_specs: list[tuple[str, str, list[str]]] = []
+        single_inv_site: tuple[str, str, int, int] | None = None
+        dict_narrow_exprs: set[str] | None = None
+        dict_narrow_dtypes: set[str] | None = None
+        dict_narrow_meta: tuple[str, bool] | None = None
 
         for fp in file_patches:
             rel = fp.path
@@ -953,6 +1006,43 @@ class BlastRadiusSelector:
                 qn.startswith("_Dialect.") for qn in edit.enclosing_funcs
             ):
                 can_slice_fixtures = False
+
+            if (
+                len(file_patches) == 1
+                and fp.old_path == rel
+                and rel.startswith("sqlglot/")
+                and orig_text is not None
+                and new_text is not None
+                and not edit.syntax_error
+                and not edit.is_added_or_deleted
+            ):
+                if not edit.class_level_edits and not edit.module_level_edit:
+                    inv_op = detect_single_invariant_op_edit(orig_text, new_text)
+                    if inv_op is not None:
+                        single_inv_site = (rel, inv_op[0], inv_op[1], inv_op[2])
+                elif (
+                    not edit.enclosing_funcs
+                    and not edit.class_non_attr_edits
+                    and len(edit.dict_key_edits) == 1
+                ):
+                    tkey, (tags, keys_changed) = next(iter(edit.dict_key_edits.items()))
+                    attr = tkey.split(":", 1)[1]
+                    if (
+                        attr in ("TRANSFORMS", "PROPERTIES_LOCATION", "EXPRESSION_METADATA")
+                        and tags
+                        and all(t.startswith("exp:") for t in tags)
+                    ):
+                        resolved = [self._expr_short_to_full.get(t[4:]) for t in tags]
+                        if all(fc is not None for fc in resolved):
+                            dict_narrow_exprs = {fc for fc in resolved if fc is not None}
+                            dict_narrow_meta = (attr, keys_changed)
+                    elif (
+                        attr == "TYPE_MAPPING"
+                        and tags
+                        and all(t.startswith("dtype:") for t in tags)
+                    ):
+                        dict_narrow_dtypes = {t[6:] for t in tags}
+                        dict_narrow_meta = (attr, keys_changed)
 
             if rel == "sqlglot/parser.py" and is_parser_max_nodes_edit(edit):
                 parser_max_nodes_touched = True
@@ -1275,7 +1365,88 @@ class BlastRadiusSelector:
                         candidates.update(self.tests_by_file.get(rel, ()))
                         candidates.update(self._tests_for_rev_imports(rel))
 
+        # Pillar 1: Exact dynamic-invariant induction pruning for single pure operator edits
+        if (
+            single_inv_site is not None
+            and not has_fixture_change
+            and not has_syntax_or_import_break
+            and not check_import_rels
+            and not has_binary_change
+        ):
+            inv_rel, inv_kind, inv_ln, inv_col = single_inv_site
+            self._ensure_invariants()
+            diff_set = self._inv_sites[inv_kind].get((inv_rel, inv_ln, inv_col))
+            if diff_set is not None:
+                preserved: set[int] = set()
+                if inv_rel in DEFAULT_CORE_FILES and self.lazy_load_num in candidates:
+                    preserved.add(self.lazy_load_num)
+                if inv_rel.startswith("sqlglot/typing/") and self.typing_num in candidates:
+                    preserved.add(self.typing_num)
+                candidates = (candidates & diff_set) | preserved
+
+        # Pillar 2: Declarative dictionary key narrowing (TRANSFORMS, PROPERTIES_LOCATION, EXPRESSION_METADATA, TYPE_MAPPING)
+        if (
+            dict_narrow_exprs
+            and dict_narrow_meta is not None
+            and not has_fixture_change
+            and not has_syntax_or_import_break
+            and not has_binary_change
+        ):
+            dn_attr, dn_keys_changed = dict_narrow_meta
+            expr_union: set[int] = set()
+            for fc in dict_narrow_exprs:
+                expr_union.update(self.expr_to_tests.get(fc, ()))
+            kept: set[int] = set()
+            if dn_attr == "EXPRESSION_METADATA":
+                kept.update(t for t in self.tests_by_file.get("tests/test_typing.py", ()) if t in candidates)
+            if dn_keys_changed:
+                if self.gen_mem_num in candidates:
+                    kept.add(self.gen_mem_num)
+                kept.update(t for t in self.tests_by_file.get("tests/test_dialect_imports.py", ()) if t in candidates)
+                if "sqlglot/generator.py" in patched_files:
+                    kept.update(t for t in self.tests_by_file.get("tests/test_generator.py", ()) if t in candidates)
+            candidates = (candidates & expr_union) | kept
+            if expr_class_edits is None:
+                expr_class_edits = set(dict_narrow_exprs)
+            else:
+                expr_class_edits.update(dict_narrow_exprs)
+        elif (
+            dict_narrow_dtypes
+            and dict_narrow_meta is not None
+            and not has_fixture_change
+            and not has_syntax_or_import_break
+            and not has_binary_change
+        ):
+            _, dn_keys_changed = dict_narrow_meta
+            self._ensure_invariants()
+            if all(dt in self._dtype_to_tests for dt in dict_narrow_dtypes):
+                dt_union: set[int] = set()
+                for dt in dict_narrow_dtypes:
+                    dt_union.update(self._dtype_to_tests[dt])
+                kept = set()
+                if dn_keys_changed:
+                    if self.gen_mem_num in candidates:
+                        kept.add(self.gen_mem_num)
+                    kept.update(t for t in self.tests_by_file.get("tests/test_dialect_imports.py", ()) if t in candidates)
+                candidates = (candidates & dt_union) | kept
+
         if not candidates:
+            if check_import_rels and not has_binary_change:
+                need_t0_imp = any(p in DEFAULT_CORE_FILES for p in patched_files)
+                st_imp, pl_imp = self.runner.run_job(
+                    {
+                        "patched_files": patched_files,
+                        "check_import_rels": check_import_rels,
+                        "serde_touched": serde_touched,
+                        "tests": [],
+                    },
+                    need_tier0=need_t0_imp,
+                )
+                if st_imp == "import_err":
+                    exp_err: set[int] = set()
+                    for br in pl_imp:
+                        exp_err.update(self._import_blast_radius(br))
+                    return pack_workers(exp_err, self.dur_ms)
             return []
 
         if has_binary_change:
@@ -1690,11 +1861,16 @@ class BlastRadiusSelector:
             "test_optimize_in_nulls",
             "test_optimize_special_joins",
         }
-        _stage_scale = (
-            min(1.0, max(0.12, (early_stage + 2) / 14.0))
-            if early_stage is not None
-            else 1.0
-        )
+        if early_stage is None:
+            _stage_scale = 1.0
+        elif early_stage == -1:
+            _stage_scale = 0.12
+        elif early_stage == 0:
+            _stage_scale = 0.60
+        elif early_stage <= 4:
+            _stage_scale = 0.82
+        else:
+            _stage_scale = 0.95
         verification_cpu_ms: dict[int, float] = {}
         opt_tpcds_num = self.by_id.get("tests/test_optimizer.py::TestOptimizer::test_tpcds")
         scope_num = self.by_id.get("tests/test_optimizer.py::TestOptimizer::test_scope")
@@ -1832,6 +2008,15 @@ class BlastRadiusSelector:
                     )
                 )
             )
+            allow_share_tpcds = bool(
+                opt_dialect_filter
+                or early_stage == -1
+                or (
+                    fixture_index_masks is not None
+                    and "optimizer/tpc-ds/tpc-ds.sql" in fixture_index_masks
+                    and fixture_index_masks["optimizer/tpc-ds/tpc-ds.sql"].bit_count() <= 40
+                )
+            )
             job = {
                 "patched_files": patched_files,
                 "hot_patch_specs": hot_patch_specs if use_hot_patches else None,
@@ -1860,6 +2045,8 @@ class BlastRadiusSelector:
                 "early_stage": early_stage,
                 "allow_lambda_exec": allow_lambda_exec,
                 "allow_direct_iteration": allow_lambda_exec,
+                "pure_executor_only": pure_executor_only,
+                "allow_share_tpcds": allow_share_tpcds,
                 "context_table_only": context_table_only,
                 "tests": verify_list,
                 "dur_ms_map": {n: self.dur_ms[n] for n in candidates},

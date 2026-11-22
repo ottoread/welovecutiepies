@@ -48,13 +48,8 @@ def _load_csv_rows(file_name: str) -> list[tuple]:
     return rows
 
 
-def _build_fast_plans() -> None:
-    plans_path = APP_DIR / "tpcds_plans.zlib"
-    if not plans_path.is_file():
-        return
+def _make_plan_encoder():
     from sqlglot import exp, planner
-
-    raw_plans = pickle.loads(plans_path.read_bytes())
 
     def enc(obj):
         if isinstance(obj, exp.Expr):
@@ -99,6 +94,16 @@ def _build_fast_plans() -> None:
         np._dag = None
         return np
 
+    return enc_plan
+
+
+def _build_fast_plans() -> None:
+    plans_path = APP_DIR / "tpcds_plans.zlib"
+    if not plans_path.is_file():
+        return
+    enc_plan = _make_plan_encoder()
+    raw_plans = pickle.loads(plans_path.read_bytes())
+
     out_dir = APP_DIR / "tpcds_plans_fast"
     out_dir.mkdir(exist_ok=True)
     total_bytes = 0
@@ -109,6 +114,80 @@ def _build_fast_plans() -> None:
         fp.write_bytes(data)
         total_bytes += len(data)
     print(f"Built {out_dir} ({total_bytes / 1024:.1f} KB, {len(raw_plans)} plans)", file=sys.stderr)
+
+
+def _build_executor_unit_plans() -> None:
+    """Pre-build fast encoded Plans for TestExecutor's non-TPCDS unit tests (used on pure_executor_only commits)."""
+    import hashlib
+    import unittest
+    import sqlglot.executor as ex_pkg
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.helper import dict_depth
+    from sqlglot.optimizer import optimize
+    from sqlglot.optimizer.annotate_types import annotate_types
+    from sqlglot.planner import Plan
+    from sqlglot.schema import ensure_schema, flatten_schema, nested_get, nested_set
+    from sqlglot import exp
+
+    enc_plan = _make_plan_encoder()
+    unit_plans: dict[str, bytes] = {}
+    orig_execute = ex_pkg.execute
+
+    def recording_execute(sql, schema=None, dialect=None, tables=None):
+        if isinstance(sql, str):
+            try:
+                tables_ = ensure_tables(tables, dialect=dialect)
+                sch = schema
+                if not sch:
+                    sch = {}
+                    flattened = flatten_schema(tables_.mapping, depth=dict_depth(tables_.mapping))
+                    for keys in flattened:
+                        tbl = nested_get(tables_.mapping, *zip(keys, keys))
+                        if tbl is None:
+                            continue
+                        for column in tbl.columns:
+                            value = tbl[0][column]
+                            col_type = (
+                                annotate_types(exp.convert(value), dialect=dialect).type
+                                or type(value).__name__
+                            )
+                            nested_set(sch, [*keys, column], col_type)
+                sch_obj = ensure_schema(sch, dialect=dialect)
+                if not (tables_.supported_table_args and tables_.supported_table_args != sch_obj.supported_table_args):
+                    key = hashlib.sha256(
+                        f"{sql}\x00{repr(sch_obj.mapping)}\x00{dialect!r}".encode("utf-8")
+                    ).hexdigest()[:16]
+                    if key not in unit_plans:
+                        expression = optimize(sql, sch_obj, leave_tables_isolated=True, dialect=dialect)
+                        plan = Plan(expression)
+                        unit_plans[key] = pickle.dumps(enc_plan(plan), protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                pass
+        return orig_execute(sql, schema=schema, dialect=dialect, tables=tables)
+
+    import tests.test_executor as te
+    ex_pkg.execute = recording_execute
+    te.execute = recording_execute
+    try:
+        cls = te.TestExecutor
+        cls.cache = {}
+        skip = {"test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"}
+        for mname in dir(cls):
+            if mname.startswith("test_") and mname not in skip:
+                try:
+                    c = cls(mname)
+                    r = unittest.TestResult()
+                    c.run(r)
+                except Exception:
+                    pass
+    finally:
+        ex_pkg.execute = orig_execute
+        te.execute = orig_execute
+
+    out_p = APP_DIR / "executor_unit_plans.pkl"
+    data = pickle.dumps(unit_plans, protocol=pickle.HIGHEST_PROTOCOL)
+    out_p.write_bytes(data)
+    print(f"Built {out_p} ({len(data) / 1024:.1f} KB, {len(unit_plans)} unit plans)", file=sys.stderr)
 
 
 def main() -> None:
@@ -127,6 +206,7 @@ def main() -> None:
         total_bytes += p.stat().st_size
     print(f"Built {out_dir} ({total_bytes / 1024:.1f} KB, {len(TPCDS_SCHEMA)} tables)", file=sys.stderr)
     _build_fast_plans()
+    _build_executor_unit_plans()
 
 
 if __name__ == "__main__":
