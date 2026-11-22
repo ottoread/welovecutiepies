@@ -1363,6 +1363,7 @@ def _load_tpcds_table_python(dir_tpcds: str, tname: str, columns: dict) -> Any:
         next(reader)
         rows = []
         ctypes = []
+        convert = None
         for row in reader:
             if not ctypes:
                 for v in row:
@@ -1370,10 +1371,45 @@ def _load_tpcds_table_python(dir_tpcds: str, tname: str, columns: dict) -> Any:
                         ctypes.append(type(ast.literal_eval(v)))
                     except (ValueError, SyntaxError):
                         ctypes.append(str)
-            rows.append(
-                tuple(None if (ct is not str and v == "") else ct(v) for ct, v in zip(ctypes, row))
-            )
+                if ctypes:
+                    # The generated expression contains only column indices. Conversion
+                    # types are inferred exactly as for the generic ragged-row path.
+                    values = [
+                        f"row[{i}]" if ct is str else f"types[{i}](row[{i}]) if row[{i}] else None"
+                        for i, ct in enumerate(ctypes)
+                    ]
+                    convert = eval(f"lambda row: ({', '.join(values)},)", {"types": tuple(ctypes)})
+            if convert is not None and len(row) >= len(ctypes):
+                rows.append(convert(row))
+            else:
+                rows.append(
+                    tuple(None if (ct is not str and v == "") else ct(v) for ct, v in zip(ctypes, row))
+                )
     return Table(columns=columns, rows=rows)
+
+
+def _order_tpcds_queries(
+    indices: list[int], times: dict[int, float], touched: dict[int, int], coverage: dict[int, int]
+) -> list[int]:
+    def rank(idx):
+        return -touched.get(idx, 0), times.get(idx, 1.0), idx
+
+    remaining = set(indices)
+    ordered: list[int] = []
+    seen = 0
+    # Diversify a small initial set of probes; retain the cheap-first order for the rest.
+    if coverage:
+        for _ in range(min(6, len(remaining))):
+            idx = min(remaining, key=lambda i: (
+                -touched.get(i, 0),
+                -(coverage.get(i, 0) & ~seen).bit_count() / max(times.get(i, 1.0), 0.001),
+                times.get(i, 1.0),
+                i,
+            ))
+            ordered.append(idx)
+            remaining.remove(idx)
+            seen |= coverage.get(idx, 0)
+    return ordered + sorted(remaining, key=rank)
 
 
 def verify_execute_tpcds_fast(
@@ -1392,6 +1428,8 @@ def verify_execute_tpcds_fast(
     early_stage: int | None = None,
     patched_files: dict[str, str | None] | None = None,
     overall_budget_s: float = 28.0,
+    q_hit_counts: dict[int, int] | None = None,
+    q_coverage: dict[int, int] | None = None,
 ) -> bool:
     """Interleaved fail-fast turbo verifier for test_execute_tpcds (21.454 s!)."""
     t_start = time.monotonic()
@@ -1402,7 +1440,7 @@ def verify_execute_tpcds_fast(
         from sqlglot import find_tables, parse_one, transpile
         from sqlglot.executor import execute
         from sqlglot.executor.python import PythonExecutor
-        from sqlglot.executor.table import ensure_tables
+        from sqlglot.executor.table import Table, ensure_tables
         from sqlglot.optimizer import RULES, optimize
         from sqlglot.schema import ensure_schema
         from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
@@ -1410,10 +1448,12 @@ def verify_execute_tpcds_fast(
         tpcds_schema_obj = ensure_schema(TPCDS_SCHEMA)
         tpcds_sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
         dir_tpcds = FIXTURES_DIR + "/optimizer/tpc-ds/"
+        table_patched = "sqlglot/executor/table.py" in pf
 
-        if "sqlglot/executor/table.py" in pf:
+        if table_patched:
             # Verify TestExecutor.setUpClass() Table construction even if no queries are affected!
             _load_tpcds_table_python(dir_tpcds, "call_center", TPCDS_SCHEMA["call_center"])
+            q_hit_counts = q_coverage = None
 
         if affected_q_indices is None or affected_duckdb_qs is None:
             indices = [i for i, (m, _, _) in enumerate(tpcds_sqls) if m.get("execute")]
@@ -1423,7 +1463,7 @@ def verify_execute_tpcds_fast(
             indices = [i for i in all_aff if tpcds_sqls[i][0].get("execute")]
             non_exec_indices = [i for i in all_aff if not tpcds_sqls[i][0].get("execute")]
 
-        indices.sort(key=lambda i: tpcds_q_times.get(i, 1.0))
+        indices = _order_tpcds_queries(indices, tpcds_q_times, q_hit_counts or {}, q_coverage or {})
 
         if serde_touched:
             for i, (m, sql, _) in enumerate(tpcds_sqls):
@@ -1439,6 +1479,7 @@ def verify_execute_tpcds_fast(
 
         loaded_tables: dict[str, Any] = {}
         conn = None
+        join_budget_exceeded = False
         duck_views: set[str] = set()
         raw_plans: dict[int, bytes] | None = None
         if pure_executor_only:
@@ -1446,9 +1487,18 @@ def verify_execute_tpcds_fast(
             if plans_path.is_file():
                 raw_plans = pickle.loads(plans_path.read_bytes())
 
-        def ensure_table(tname: str) -> None:
-            if tname not in loaded_tables:
-                loaded_tables[tname] = _load_tpcds_table_python(dir_tpcds, tname, TPCDS_SCHEMA[tname])
+        def query_tables(needed: list[str]) -> dict:
+            tables = {}
+            for tname in needed:
+                if tname not in loaded_tables:
+                    loaded_tables[tname] = _load_tpcds_table_python(dir_tpcds, tname, TPCDS_SCHEMA[tname])
+                table = loaded_tables[tname]
+                # Some operators write into their input tables. Keep reordered queries independent.
+                tables[tname] = (
+                    Table(table.columns, table.rows.copy(), table.column_range)
+                    if not table_patched and (q_coverage or q_hit_counts) else table
+                )
+            return tables
 
         def ensure_duck_view(tname: str) -> None:
             nonlocal conn
@@ -1470,6 +1520,8 @@ def verify_execute_tpcds_fast(
             force_duckdb: bool = False,
             duck_sql_override: str | None = None,
         ) -> None:
+            if join_budget_exceeded:
+                raise TimeoutError("TPC-DS verification nested-loop work budget")
             if not force_duckdb:
                 res_sig = repr((table.columns, table.rows)).encode("utf-8")
                 if hashlib.sha256(res_sig).hexdigest()[:16] == tpcds_exec_hashes.get(idx):
@@ -1489,6 +1541,21 @@ def verify_execute_tpcds_fast(
             assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
 
         init_patched = "sqlglot/__init__.py" in pf
+        original_nested_join = None
+        if q_coverage and not any(f in pf for f in (
+            "sqlglot/executor/python.py", "sqlglot/executor/context.py", "sqlglot/executor/table.py",
+        )):
+            original_nested_join = PythonExecutor.nested_loop_join
+
+            def bounded_nested_join(self, join, source, target, condition, condition_context):
+                nonlocal join_budget_exceeded
+                if len(source.table.rows) * len(target.table.rows) >= 100_000_000:
+                    # Keep the test selected when the unchanged Python join would exhaust verification.
+                    join_budget_exceeded = True
+                    raise TimeoutError("TPC-DS verification nested-loop work budget")
+                return original_nested_join(self, join, source, target, condition, condition_context)
+
+            PythonExecutor.nested_loop_join = bounded_nested_join
 
         try:
             for idx in indices:
@@ -1558,9 +1625,7 @@ def verify_execute_tpcds_fast(
                                 opt = optimize(parse_one(sql), schema=tpcds_schema_obj, leave_tables_isolated=True)
                             finally:
                                 _active_opt_sql_ctx[0] = prev_sql
-                        for tname in needed:
-                            ensure_table(tname)
-                        q_tables = {tname: loaded_tables[tname] for tname in needed}
+                        q_tables = query_tables(needed)
                         from sqlglot.planner import Plan
                         table = PythonExecutor(tables=ensure_tables(q_tables)).execute(Plan(opt))
                         import numpy as np
@@ -1579,9 +1644,7 @@ def verify_execute_tpcds_fast(
                                 opt = optimize(parse_one(sql), schema=tpcds_schema_obj, leave_tables_isolated=True)
                             finally:
                                 _active_opt_sql_ctx[0] = prev_sql
-                        for tname in needed:
-                            ensure_table(tname)
-                        q_tables = {tname: loaded_tables[tname] for tname in needed}
+                        q_tables = query_tables(needed)
                         from sqlglot.planner import Plan
                         table = PythonExecutor(tables=ensure_tables(q_tables)).execute(Plan(opt))
                         check_result(idx, sql, needed, table)
@@ -1591,9 +1654,7 @@ def verify_execute_tpcds_fast(
                         dh = hashlib.sha256(duck_sql.encode("utf-8")).hexdigest()[:16]
                         duck_changed = (dh != tpcds_duckdb_hashes.get(idx))
                     needed = tpcds_q_tables.get(idx) or [t.name for t in find_tables(parse_one(sql))]
-                    for tname in needed:
-                        ensure_table(tname)
-                    q_tables = {tname: loaded_tables[tname] for tname in needed}
+                    q_tables = query_tables(needed)
                     plan = pickle.loads(zlib.decompress(raw_plans[idx]))
                     table = PythonExecutor(tables=ensure_tables(q_tables)).execute(plan)
                     check_result(idx, sql, needed, table, force_duckdb=duck_changed, duck_sql_override=duck_sql)
@@ -1604,12 +1665,12 @@ def verify_execute_tpcds_fast(
                         dh = hashlib.sha256(duck_sql.encode("utf-8")).hexdigest()[:16]
                         duck_changed = (dh != tpcds_duckdb_hashes.get(idx))
                     needed = tpcds_q_tables.get(idx) or [t.name for t in find_tables(expr)]
-                    for tname in needed:
-                        ensure_table(tname)
-                    q_tables = {tname: loaded_tables[tname] for tname in needed}
+                    q_tables = query_tables(needed)
                     table = execute(expr, schema=tpcds_schema_obj, tables=q_tables)
                     check_result(idx, sql, needed, table, force_duckdb=duck_changed, duck_sql_override=duck_sql)
         finally:
+            if original_nested_join is not None:
+                PythonExecutor.nested_loop_join = original_nested_join
             signal.setitimer(signal.ITIMER_REAL, 0)
             if conn is not None:
                 conn.close()

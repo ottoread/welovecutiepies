@@ -227,9 +227,9 @@ class PyEditInfo:
     orig_changed_lines: set[int] = field(default_factory=set)
     # Dict-key diffs for class/module dict assignments: "Scope:ATTR" -> (changed_key_tags_or_None, keys_added_or_removed)
     dict_key_edits: dict[str, tuple[set[str] | None, bool]] = field(default_factory=dict)
-    # If ONLY private module-level constant assignment(s) changed, exact lines & func entries inside functions reading them
+    # Exact runtime reads and the name to check for consumers outside this module.
     const_reader_lines: set[int] | None = None
-    const_reader_func_entries: set[int] = field(default_factory=set)
+    const_reader_symbol: str | None = None
 
 
 def _node_span(node: ast.AST) -> tuple[int, int]:
@@ -559,14 +559,8 @@ def analyze_python_edit(
     # Dict-key diffing for edited class attributes and module-level dict assignments!
     _analyze_dict_key_edits(orig_ast, new_ast, info)
 
-    # Module-level constant-to-reader propagation (when ONLY simple module-level assignments changed!)
-    if (
-        info.module_level_edit
-        and info.module_level_names
-        and not info.class_level_edits
-        and not info.enclosing_funcs
-    ):
-        _analyze_const_readers(orig_ast, new_ast, info, _first_exec_line)
+    if (info.module_level_edit or info.class_attr_edits) and not info.enclosing_funcs:
+        _analyze_const_readers(orig_ast, new_ast, info)
 
     return info
 
@@ -672,95 +666,241 @@ def _analyze_dict_key_edits(orig_ast: ast.AST, new_ast: ast.AST, info: PyEditInf
             info.dict_key_edits[tkey] = _diff_dict_nodes(od, nd)
 
 
-def _simple_assign_names(stmt: ast.stmt) -> set[str] | None:
-    if isinstance(stmt, ast.Assign) and all(isinstance(t, ast.Name) for t in stmt.targets):
-        return {t.id for t in stmt.targets}
-    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
-        return {stmt.target.id}
+def _single_changed_statement(old_body, new_body):
+    if len(old_body) == len(new_body):
+        changes = [
+            (old, new) for old, new in zip(old_body, new_body) if ast.dump(old) != ast.dump(new)
+        ]
+        if len(changes) == 1:
+            return changes[0]
     return None
 
 
-def _analyze_const_readers(
-    orig_ast: ast.Module,
-    new_ast: ast.Module,
-    info: PyEditInfo,
-    first_exec_fn,
-) -> None:
-    """If the ONLY difference between orig_ast and new_ast is value(s) of simple module-level
-    assignments `X = ...` that are NOT read at module/class top level and NOT in `__all__`,
-    collect the exact lines & function entry lines where `X` is read inside function bodies."""
-    if len(orig_ast.body) != len(new_ast.body):
-        return
-    edited_names: set[str] = set()
-    edited_indices: set[int] = set()
-    for i, (os_stmt, ns_stmt) in enumerate(zip(orig_ast.body, new_ast.body)):
-        if ast.dump(os_stmt, include_attributes=False) == ast.dump(ns_stmt, include_attributes=False):
-            continue
-        on = _simple_assign_names(os_stmt)
-        nn = _simple_assign_names(ns_stmt)
-        if not on or on != nn:
-            return
-        edited_names.update(on)
-        edited_indices.add(i)
-
-    if not edited_names or "__all__" in edited_names:
-        return
-
-    # Check if any edited name is exported in __all__ or read outside function bodies
-    for i, stmt in enumerate(orig_ast.body):
-        if i in edited_indices:
-            continue
-        if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
-            for node in ast.walk(stmt.value):
-                if isinstance(node, ast.Constant) and node.value in edited_names:
-                    return
-        # Check non-function code (module-level statements & class bodies outside methods)
-        if _reads_name_outside_funcs(stmt, edited_names):
-            return
-
-    # Collect every line inside function/method bodies reading any of edited_names
-    reader_lines: set[int] = set()
-    reader_entries: set[int] = set()
-
-    def scan_funcs(body: list[ast.stmt]) -> None:
-        for stmt in body:
-            if isinstance(stmt, ast.ClassDef):
-                scan_funcs(stmt.body)
-            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                found = False
-                for node in ast.walk(stmt):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in edited_names:
-                        ln = getattr(node, "lineno", 0)
-                        if ln:
-                            reader_lines.add(ln)
-                            found = True
-                if found:
-                    fl = first_exec_fn(stmt)
-                    if fl is not None:
-                        reader_entries.add(fl)
-
-    scan_funcs(orig_ast.body)
-    if reader_lines:
-        info.const_reader_lines = reader_lines
-        info.const_reader_func_entries = reader_entries
+def _changed_class_member(original: str, patched: str) -> tuple[tuple[str, ...], tuple] | None:
+    change = _single_changed_statement(ast.parse(original).body, ast.parse(patched).body)
+    owners = []
+    while change is not None:
+        old, new = change
+        if not isinstance(old, ast.ClassDef) or not isinstance(new, ast.ClassDef):
+            return (tuple(owners), change) if owners else None
+        old_body, new_body = old.body, new.body
+        old.body, new.body = [], []
+        if ast.dump(old) != ast.dump(new):
+            return None
+        owners.append(old.name)
+        change = _single_changed_statement(old_body, new_body)
+    return None
 
 
-def _reads_name_outside_funcs(node: ast.AST, names: set[str]) -> bool:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        # Decorators & default args execute at class/module definition time!
-        for d in node.decorator_list:
-            if _reads_name_outside_funcs(d, names):
-                return True
-        for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
-            if _reads_name_outside_funcs(d, names):
-                return True
+def is_numeric_escape_value_edit(original: str, patched: str) -> bool:
+    change = _changed_class_member(original, patched)
+    if change is None or change[0][-1] != "Tokenizer":
         return False
-    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in names:
-        return True
-    for child in ast.iter_child_nodes(node):
-        if _reads_name_outside_funcs(child, names):
-            return True
-    return False
+    pair = change[1]
+    if not all(
+        isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "NUMERIC_ESCAPES"
+        and isinstance(stmt.value, ast.Dict) and stmt.value.keys
+        and all(isinstance(k, ast.Constant) and type(k.value) is str for k in stmt.value.keys)
+        and all(isinstance(v, ast.Tuple) and len(v.elts) == 4 and all(
+            isinstance(n, ast.Constant) and type(n.value) is int for n in v.elts
+        ) for v in stmt.value.values)
+        for stmt in pair
+    ):
+        return False
+    old, new = pair
+    return [k.value for k in old.value.keys] == [k.value for k in new.value.keys]
+
+
+def is_normalization_enum_comparison_edit(original: str, patched: str) -> bool:
+    change = _changed_class_member(original, patched)
+    if change is None or change[0] != ("Dialect",):
+        return False
+    pair = change[1]
+    if not all(isinstance(node, ast.FunctionDef) and node.name == "case_sensitive" for node in pair):
+        return False
+
+    # Built-in fixture dialects initialize this slot with NormalizationStrategy members.
+    # Equality and identity agree for two members of that enum.
+    for method in pair:
+        for node in ast.walk(method):
+            if (
+                isinstance(node, ast.Compare) and len(node.ops) == 1
+                and ast.unparse(node.left) == "self.normalization_strategy"
+                and isinstance(right := node.comparators[0], ast.Attribute)
+                and isinstance(right.value, ast.Name) and right.value.id == "NormalizationStrategy"
+            ):
+                if isinstance(node.ops[0], ast.Is):
+                    node.ops[0] = ast.Eq()
+                elif isinstance(node.ops[0], ast.IsNot):
+                    node.ops[0] = ast.NotEq()
+    return ast.dump(pair[0]) == ast.dump(pair[1])
+
+
+def has_only_shadowed_metadata_inserts(original: str, patched: str, parent: str) -> bool:
+    """Prove that new leading entries are overwritten by the original parent spread."""
+    name = "EXPRESSION_METADATA"
+    change = _single_changed_statement(ast.parse(original).body, ast.parse(patched).body)
+    if change is None or not all(
+        isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == name
+        and isinstance(stmt.value, ast.Dict) for stmt in change
+    ):
+        return False
+    old, new = (stmt.value for stmt in change)
+    if not old.keys or old.keys[0] is not None or not (
+        isinstance(old.values[0], ast.Name) and old.values[0].id == name
+    ):
+        return False
+    added = len(new.keys) - len(old.keys)
+    if added <= 0 or any(
+        ast.dump(before) != ast.dump(after) if before is not None and after is not None
+        else before is not after
+        for before, after in zip(old.keys, new.keys[added:])
+    ) or any(ast.dump(a) != ast.dump(b) for a, b in zip(old.values, new.values[added:])):
+        return False
+
+    inherited: set[str] = set()
+    for stmt in ast.parse(parent).body:
+        if not (isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+                and stmt.target.id == name and isinstance(stmt.value, ast.Dict)):
+            continue
+        for key, value in zip(stmt.value.keys, stmt.value.values):
+            if key is not None:
+                inherited.add(ast.dump(key))
+            elif isinstance(value, ast.DictComp) and len(value.generators) == 1:
+                source = value.generators[0]
+                if (not source.ifs and isinstance(source.iter, ast.Set)
+                    and isinstance(value.key, ast.Name) and isinstance(source.target, ast.Name)
+                    and value.key.id == source.target.id):
+                    inherited.update(ast.dump(item) for item in source.iter.elts)
+    return all(
+        isinstance(key, ast.Attribute) and isinstance(key.value, ast.Name) and key.value.id == "exp"
+        and ast.dump(key) in inherited
+        and isinstance(value, ast.Dict) and len(value.keys) == 1
+        and isinstance(value.keys[0], ast.Constant) and value.keys[0].value == "returns"
+        and isinstance(value.values[0], ast.Attribute) and ast.unparse(value.values[0].value) == "exp.DType"
+        for key, value in zip(new.keys[:added], new.values[:added])
+    )
+
+
+def _analyze_const_readers(orig_ast: ast.Module, new_ast: ast.Module, info: PyEditInfo) -> None:
+    """Trace a literal container used only by direct runtime membership and lookup operations."""
+    change = _single_changed_statement(orig_ast.body, new_ast.body)
+    if change is None:
+        return
+    old, new = change
+    owner = None
+    if isinstance(old, ast.ClassDef) and isinstance(new, ast.ClassDef):
+        if old.name != new.name or any(
+            cls.bases or cls.keywords or cls.decorator_list or cls.type_params for cls in (old, new)
+        ):
+            return
+        owner = old.name
+        change = _single_changed_statement(old.body, new.body)
+        if change is None:
+            return
+        old, new = change
+    if isinstance(old, ast.AnnAssign) and isinstance(new, ast.AnnAssign):
+        if (
+            not isinstance(old.target, ast.Name)
+            or not isinstance(new.target, ast.Name)
+            or ast.dump(old.annotation) != ast.dump(new.annotation)
+            or old.value is None
+            or new.value is None
+        ):
+            return
+        old_target, new_target = old.target, new.target
+    elif all(
+        isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name) for stmt in (old, new)
+    ):
+        old_target, new_target = old.targets[0], new.targets[0]
+    else:
+        return
+    name = old_target.id
+    if name != new_target.id or not name.isupper():
+        return
+    allowed_types = (ast.Dict,) if owner else (ast.Dict, ast.Set, ast.Tuple)
+    try:
+        old_literal = ast.literal_eval(old.value)
+        new_literal = ast.literal_eval(new.value)
+    except (SyntaxError, TypeError, ValueError):
+        return
+    scalar = owner is None and type(old_literal) is type(new_literal) and type(old_literal) in (
+        str, bytes, int, float, complex, bool, type(None),
+    )
+    if not scalar and (type(old.value) is not type(new.value) or not isinstance(old.value, allowed_types)):
+        return
+
+    parents = {child: node for node in ast.walk(orig_ast) for child in ast.iter_child_nodes(node)}
+    runtime = {
+        node: fn.name
+        for fn in ast.walk(orig_ast)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for stmt in fn.body
+        for node in ast.walk(stmt)
+    }
+    symbol = owner or name
+    lines: set[int] = set()
+    readers: set[str] = set()
+    for node in parents:
+        if isinstance(node, ast.Constant) and node.value in (symbol, name):
+            return
+        if not isinstance(node, ast.Name):
+            continue
+        if node.id in {"globals", "locals", "vars", "eval", "exec"}:
+            return
+        if node.id != symbol or node is old_target:
+            continue
+        if not isinstance(node.ctx, ast.Load) or node not in runtime:
+            return
+        readers.add(runtime[node])
+        if scalar:
+            lines.add(node.lineno)
+            continue
+        access = node
+        if owner:
+            access = parents[node]
+            if (not isinstance(access, ast.Attribute) or access.attr != name
+                or not isinstance(access.ctx, ast.Load)):
+                return
+        reader = parents[access]
+        if isinstance(reader, ast.Compare) and any(
+            right is access and isinstance(op, (ast.In, ast.NotIn))
+            for op, right in zip(reader.ops, reader.comparators)
+        ):
+            pass
+        elif isinstance(old.value, ast.Dict) and (
+            (isinstance(reader, ast.Subscript) and reader.value is access and isinstance(reader.ctx, ast.Load))
+            or (isinstance(reader, ast.Attribute) and reader.attr == "get"
+                and isinstance(parents[reader], ast.Call) and parents[reader].func is reader)
+        ):
+            pass
+        else:
+            return
+        lines.update((reader.lineno, access.lineno))
+    if not lines:
+        return
+
+    # A direct or transitive call from module/class initialization can cache the
+    # changed value before fixture coverage starts. Keep the import-wide fallback.
+    referrers: dict[str, set[str | None]] = {}
+    for node in parents:
+        if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
+            ref = node.id if isinstance(node, ast.Name) else node.attr
+            referrers.setdefault(ref, set()).add(runtime.get(node))
+    pending = list(readers)
+    while pending:
+        for caller in referrers.get(pending.pop(), ()):
+            if caller is None:
+                return
+            if caller not in readers:
+                readers.add(caller)
+                pending.append(caller)
+
+    info.const_reader_lines = lines
+    info.const_reader_symbol = symbol
 
 
 def _find_enclosing_lambda(node: ast.AST, hit_lines: list[int]) -> ast.Lambda | None:

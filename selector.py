@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import re
 import signal
 import struct
 import sys
@@ -25,6 +26,9 @@ from patch_utils import (
     apply_file_patch,
     diff_sql_fixture_pairs,
     diff_sql_fixtures,
+    has_only_shadowed_metadata_inserts,
+    is_normalization_enum_comparison_edit,
+    is_numeric_escape_value_edit,
     parse_patch,
 )
 from worker_pack import WORKER_COST_MS, duration_ms, pack_cost_ms, pack_workers
@@ -304,6 +308,8 @@ def _execute_job_in_child(
                     tpcds_pre_merge=tpcds_pre_merge,
                     early_stage=early_stage,
                     patched_files=patched_files,
+                    q_hit_counts=tpcds_fast["q_hit_counts"],
+                    q_coverage=tpcds_fast["q_coverage"],
                 )
                 if failed:
                     failing.append(tnum)
@@ -563,6 +569,7 @@ class BlastRadiusSelector:
         self.tpcds_line_to_q: dict[str, dict[int, list[int]]] = maps["tpcds_line_to_q"]
         self.tpcds_duckdb_line_to_q: dict[str, dict[int, list[int]]] = maps.get("tpcds_duckdb_line_to_q", {})
         self.tpcds_exec_line_to_q: dict[str, dict[int, list[int]]] = maps.get("tpcds_exec_line_to_q", {})
+        self._tpcds_optimizer_cover: dict[int, int] | None = None
         self.scope_stress_lines: dict[str, set[int]] = maps.get("scope_stress_lines", {})
         self.duckdb_passing_pairs: set[str] = maps.get("duckdb_passing_pairs", set())
 
@@ -587,6 +594,7 @@ class BlastRadiusSelector:
 
         self.runner = ForkRunner()
         self._orig_cache: dict[str, str | None] = {}
+        self._external_read_cache: dict[tuple[str, str], bool] = {}
         self._batch_t0 = time.monotonic()
         self._batch_wall_budget = float(os.environ.get("BATCH_WALL_BUDGET", "145.0"))
 
@@ -607,6 +615,19 @@ class BlastRadiusSelector:
             st = pickle.loads(zlib.decompress(OPT_STAGES_PATH.read_bytes()))
             self._rule_line_masks = st.get("rule_line_masks", {})
 
+    def _tpcds_coverage(self) -> dict[int, int]:
+        if self._tpcds_optimizer_cover is None:
+            cover: dict[int, int] = {}
+            bit = 1
+            for path, lines in self.tpcds_exec_line_to_q.items():
+                if path.startswith("sqlglot/optimizer/"):
+                    for queries in lines.values():
+                        for idx in queries:
+                            cover[idx] = cover.get(idx, 0) | bit
+                        bit <<= 1
+            self._tpcds_optimizer_cover = cover
+        return self._tpcds_optimizer_cover
+
     def _read_orig(self, rel_path: str) -> str | None:
         if rel_path not in self._orig_cache:
             p = SQLGLOT_ROOT / rel_path
@@ -618,6 +639,19 @@ class BlastRadiusSelector:
             else:
                 self._orig_cache[rel_path] = None
         return self._orig_cache[rel_path]
+
+    def _has_external_reader(self, rel_path: str, symbol: str) -> bool:
+        key = (rel_path, symbol)
+        if key not in self._external_read_cache:
+            module = file_to_module(rel_path)
+            token = re.compile(rf"\b{re.escape(symbol)}\b")
+            self._external_read_cache[key] = bool(self.symbol_refs.get(f"{module}:*")) or any(
+                token.search(source.read_text(encoding="utf-8", errors="replace"))
+                for root in ("sqlglot", "tests")
+                for source in (SQLGLOT_ROOT / root).rglob("*.py")
+                if source != SQLGLOT_ROOT / rel_path
+            )
+        return self._external_read_cache[key]
 
     def _tests_for_rev_imports(self, rel_path: str) -> set[int]:
         out: set[int] = set()
@@ -678,12 +712,14 @@ class BlastRadiusSelector:
         tpcds_affected_qs: set[int] | None = set()
         tpcds_duckdb_affected_qs: set[int] | None = set()
         tpcds_exec_affected_qs: set[int] | None = set()
+        tpcds_hit_counts: dict[int, int] = {}
         touched_dialect_names: set[str] | None = set()
         allow_lambda_exec = True
         context_table_only = False
 
         # Track whether per-fixture-index bitmask slicing is 100% sound for this commit!
         can_slice_fixtures = True
+        fixture_enum_equivalent = False
         py_hit_lines_for_fixtures: list[tuple[str, set[int]]] = []
         check_import_rels: list[str] = []
         has_binary_change = False
@@ -757,6 +793,25 @@ class BlastRadiusSelector:
                 patched_files[fp.old_path] = None
 
             if (
+                len(file_patches) == 1
+                and rel == "sqlglot/typing/duckdb.py"
+                and fp.old_path == rel
+                and self.typing_num is not None
+                and orig_text is not None
+                and new_text is not None
+                and not edit.syntax_error
+                and (parent_metadata := self._read_orig("sqlglot/typing/__init__.py"))
+                and has_only_shadowed_metadata_inserts(orig_text, new_text, parent_metadata)
+            ):
+                # Optimizer readers use keyed lookups in this mapping. The typing suite
+                # enumerates it, so keep that check and still verify import-time evaluation.
+                candidates.update(self.tests_by_file.get("tests/test_typing.py", ()))
+                candidates.update(self.open_file_to_tests.get(rel, ()))
+                check_import_rels.append(rel)
+                can_slice_fixtures = False
+                continue
+
+            if (
                 rel == "sqlglot/serde.py"
                 or rel == "sqlglot/expressions/core.py"
                 or rel == "sqlglot/expressions/__init__.py"
@@ -783,6 +838,36 @@ class BlastRadiusSelector:
 
             if rel in self.open_file_to_tests:
                 candidates.update(self.open_file_to_tests[rel])
+
+            if (
+                len(file_patches) == 1
+                and fp.old_path == rel
+                and orig_text is not None
+                and new_text is not None
+                and not edit.syntax_error
+            ):
+                if rel == "sqlglot/dialects/dialect.py" and edit.enclosing_funcs == {"Dialect.case_sensitive"}:
+                    fixture_enum_equivalent = is_normalization_enum_comparison_edit(orig_text, new_text)
+                if (
+                    rel.startswith("sqlglot/dialects/")
+                    and any("NUMERIC_ESCAPES" in names for names in edit.class_attr_edits.values())
+                    and is_numeric_escape_value_edit(orig_text, new_text)
+                ):
+                    # Metaclass and generator readers only inspect membership or truthiness,
+                    # which are unchanged. Only the tokenizer reads the literal tuple values.
+                    core = "sqlglot/tokenizer_core.py"
+                    reader_lines = {
+                        ln for ln, line in enumerate((self._read_orig(core) or "").splitlines(), 1)
+                        if "spec = self.numeric_escapes.get(" in line
+                    }
+                    core_coverage = self.line_to_tests.get(core, {})
+                    if len(reader_lines) == 2 and reader_lines.intersection(core_coverage):
+                        for ln in reader_lines:
+                            candidates.update(core_coverage.get(ln, ()))
+                        py_hit_lines_for_fixtures.append((core, reader_lines))
+                        check_import_rels.append(rel)
+                        tpcds_affected_qs = tpcds_duckdb_affected_qs = tpcds_exec_affected_qs = None
+                        continue
 
             if rel in ("sqlglot/executor/python.py", "sqlglot/generators/python.py", "sqlglot/executor/table.py"):
                 allow_lambda_exec = False
@@ -815,9 +900,19 @@ class BlastRadiusSelector:
                 check_import_rels.append(rel)
 
             f_lines = self.line_to_tests.get(rel, {})
-            hit_lines = edit.stmt_lines | edit.orig_changed_lines
+            reader_lines = None
+            if (
+                len(file_patches) == 1
+                and rel.startswith("sqlglot/")
+                and fp.old_path == rel
+                and edit.const_reader_symbol is not None
+                and not self._has_external_reader(rel, edit.const_reader_symbol)
+            ):
+                reader_lines = edit.const_reader_lines
+            broad_scope_edit = (edit.class_level_edits or edit.module_level_edit) and reader_lines is None
+            hit_lines = reader_lines if reader_lines is not None else edit.stmt_lines | edit.orig_changed_lines
 
-            if edit.class_level_edits or edit.module_level_edit or not rel.startswith("sqlglot/"):
+            if broad_scope_edit or not rel.startswith("sqlglot/"):
                 can_slice_fixtures = False
             else:
                 py_hit_lines_for_fixtures.append((rel, hit_lines | edit.func_entry_lines))
@@ -830,7 +925,7 @@ class BlastRadiusSelector:
             # Track TPC-DS opt, DuckDB-transpile, & exec affected queries
             if tpcds_affected_qs is not None:
                 q_map = self.tpcds_line_to_q.get(rel, {})
-                if edit.class_level_edits or edit.module_level_edit:
+                if broad_scope_edit:
                     tpcds_affected_qs = None
                 else:
                     for ln in hit_lines | edit.func_entry_lines:
@@ -839,7 +934,7 @@ class BlastRadiusSelector:
 
             if tpcds_duckdb_affected_qs is not None:
                 dq_map = self.tpcds_duckdb_line_to_q.get(rel, {})
-                if edit.class_level_edits or edit.module_level_edit:
+                if broad_scope_edit:
                     tpcds_duckdb_affected_qs = None
                 else:
                     for ln in hit_lines | edit.func_entry_lines:
@@ -848,12 +943,19 @@ class BlastRadiusSelector:
 
             if tpcds_exec_affected_qs is not None:
                 eq_map = self.tpcds_exec_line_to_q.get(rel, {})
-                if edit.class_level_edits or edit.module_level_edit:
+                if broad_scope_edit:
                     tpcds_exec_affected_qs = None
                 else:
                     for ln in hit_lines | edit.func_entry_lines:
                         if ln in eq_map:
                             tpcds_exec_affected_qs.update(eq_map[ln])
+
+            for ln in hit_lines:
+                for idx in set(self.tpcds_line_to_q.get(rel, {}).get(ln, ())).union(
+                    self.tpcds_duckdb_line_to_q.get(rel, {}).get(ln, ()),
+                    self.tpcds_exec_line_to_q.get(rel, {}).get(ln, ()),
+                ):
+                    tpcds_hit_counts[idx] = tpcds_hit_counts.get(idx, 0) + 1
 
             # 2. Enclosing function entry lines (first executable line inside body, NOT def header!)
             max_nodes_already = self.max_nodes_num in candidates
@@ -869,7 +971,7 @@ class BlastRadiusSelector:
 
             # 3. Class-level edits (with sound attr_read_tests narrowing!)
             mod = file_to_module(rel)
-            if edit.class_level_edits:
+            if edit.class_level_edits and reader_lines is None:
                 for cname in edit.class_level_edits:
                     full_cls = f"{mod}:{cname}"
                     matched = False
@@ -907,7 +1009,7 @@ class BlastRadiusSelector:
                             candidates.update(self._tests_for_rev_imports(rel))
 
             # 4. Module-level edits
-            if edit.module_level_edit:
+            if edit.module_level_edit and reader_lines is None:
                 if rel.startswith("sqlglot/typing/"):
                     if self.typing_num is not None:
                         candidates.add(self.typing_num)
@@ -1002,7 +1104,7 @@ class BlastRadiusSelector:
             self._ensure_fixture_cov()
             if self._fixture_pair_counts:
                 masks: dict[str, int] = {fname: 0 for fname in self._fixture_pair_counts}
-                for src_f, lines_set in py_hit_lines_for_fixtures:
+                for src_f, lines_set in (() if fixture_enum_equivalent else py_hit_lines_for_fixtures):
                     f_by_fix = self._src_to_fixture_masks.get(src_f)
                     if not f_by_fix:
                         continue
@@ -1019,6 +1121,10 @@ class BlastRadiusSelector:
                         short = pfile[len("tests/fixtures/"):]
                         masks.pop(short, None)
                 fixture_index_masks = masks
+
+        if fixture_enum_equivalent:
+            # TPC-DS uses the same built-in dialect initialization as these optimizer fixtures.
+            tpcds_affected_qs = tpcds_duckdb_affected_qs = set()
 
         pure_executor_only = (
             bool(real_code_files)
@@ -1093,6 +1199,10 @@ class BlastRadiusSelector:
                         "exec_hashes": self.tpcds_exec_hashes,
                         "q_times": self.tpcds_q_times,
                         "q_tables": self.tpcds_q_tables,
+                        "q_hit_counts": tpcds_hit_counts,
+                        "q_coverage": self._tpcds_coverage() if (
+                            "sqlglot/executor/__init__.py" in patched_files or "sqlglot/planner.py" in patched_files
+                        ) else {},
                         "executor_touched": executor_touched,
                         "pure_executor_only": pure_executor_only,
                     }
