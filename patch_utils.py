@@ -1,0 +1,661 @@
+"""Unified diff parser, in-memory patch applier, and Python AST / SQL fixture diff analyzer."""
+from __future__ import annotations
+
+import ast
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+@dataclass
+class Hunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+    lines: list[str]
+
+
+@dataclass
+class FilePatch:
+    old_path: str | None  # None for /dev/null (added file)
+    new_path: str | None  # None for /dev/null (deleted file)
+    hunks: list[Hunk] = field(default_factory=list)
+    is_binary: bool = False
+
+    @property
+    def path(self) -> str:
+        return self.new_path or self.old_path or ""
+
+
+def _clean_diff_path(raw: str) -> str | None:
+    raw = raw.strip()
+    if raw == "/dev/null":
+        return None
+    # Strip trailing timestamp if any (tab-separated)
+    if "\t" in raw:
+        raw = raw.split("\t", 1)[0]
+    if raw.startswith('"') and raw.endswith('"'):
+        raw = raw[1:-1]
+    if raw.startswith("a/") or raw.startswith("b/"):
+        raw = raw[2:]
+    return raw
+
+
+def parse_patch(patch_text: str) -> list[FilePatch]:
+    """Parse a git unified diff into FilePatch objects."""
+    lines = patch_text.splitlines(keepends=True)
+    patches: list[FilePatch] = []
+    cur: FilePatch | None = None
+    cur_hunk: Hunk | None = None
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+        if line.startswith("diff --git "):
+            cur = None
+            cur_hunk = None
+            i += 1
+            continue
+        if line.startswith("rename from "):
+            old_p = line[len("rename from "):].strip()
+            new_p = None
+            if i + 1 < n and lines[i + 1].startswith("rename to "):
+                new_p = lines[i + 1][len("rename to "):].strip()
+                i += 2
+            else:
+                i += 1
+            cur = FilePatch(old_path=old_p, new_path=new_p)
+            patches.append(cur)
+            cur_hunk = None
+            continue
+        if line.startswith("Binary files "):
+            if cur is not None:
+                cur.is_binary = True
+            i += 1
+            continue
+        if line.startswith("--- "):
+            old_p = _clean_diff_path(line[4:])
+            new_p = None
+            if i + 1 < n and lines[i + 1].startswith("+++ "):
+                new_p = _clean_diff_path(lines[i + 1][4:])
+                i += 2
+            else:
+                i += 1
+            if cur is not None and (cur.old_path == old_p or cur.new_path == new_p):
+                cur.old_path = old_p
+                cur.new_path = new_p
+            else:
+                cur = FilePatch(old_path=old_p, new_path=new_p)
+                patches.append(cur)
+            cur_hunk = None
+            continue
+        if line.startswith("+++ ") and cur is not None and cur.new_path is None:
+            cur.new_path = _clean_diff_path(line[4:])
+            i += 1
+            continue
+        m = _HUNK_RE.match(line)
+        if m and cur is not None:
+            old_start = int(m.group(1))
+            old_count = int(m.group(2)) if m.group(2) is not None else 1
+            new_start = int(m.group(3))
+            new_count = int(m.group(4)) if m.group(4) is not None else 1
+            cur_hunk = Hunk(old_start, old_count, new_start, new_count, [])
+            cur.hunks.append(cur_hunk)
+            i += 1
+            continue
+        if cur_hunk is not None and (
+            line.startswith(" ")
+            or line.startswith("+")
+            or line.startswith("-")
+            or line.startswith("\\ No newline at end of file")
+        ):
+            cur_hunk.lines.append(line)
+            i += 1
+            continue
+        i += 1
+
+    return patches
+
+
+def apply_file_patch(orig_text: str | None, fp: FilePatch) -> tuple[str | None, set[int], set[int]]:
+    """Apply a FilePatch in memory.
+
+    Returns (new_text_or_None_if_deleted, orig_changed_lines_1based, new_changed_lines_1based).
+    """
+    if fp.new_path is None:
+        # File deleted
+        orig_lines = orig_text.splitlines(keepends=True) if orig_text else []
+        return None, set(range(1, len(orig_lines) + 1)), set()
+
+    orig_lines = orig_text.splitlines(keepends=True) if orig_text is not None else []
+    out_lines: list[str] = []
+    orig_changed: set[int] = set()
+    new_changed: set[int] = set()
+
+    orig_idx = 0  # 0-based index into orig_lines
+
+    for hunk in fp.hunks:
+        target_orig_idx = max(0, hunk.old_start - 1) if hunk.old_count > 0 else hunk.old_start
+        # Copy untouched lines before this hunk
+        while orig_idx < target_orig_idx and orig_idx < len(orig_lines):
+            out_lines.append(orig_lines[orig_idx])
+            orig_idx += 1
+
+        # Process hunk lines
+        idx_h = 0
+        hlines = hunk.lines
+        while idx_h < len(hlines):
+            hl = hlines[idx_h]
+            if hl.startswith("\\"):
+                idx_h += 1
+                continue
+            tag = hl[0]
+            content = hl[1:]
+            # Check if next line is "\ No newline at end of file"
+            no_nl = idx_h + 1 < len(hlines) and hlines[idx_h + 1].startswith("\\")
+            if no_nl and content.endswith("\n"):
+                content = content[:-1]
+
+            if tag == " ":
+                if orig_idx < len(orig_lines):
+                    out_lines.append(orig_lines[orig_idx])
+                    orig_idx += 1
+                else:
+                    out_lines.append(content)
+            elif tag == "-":
+                orig_changed.add(orig_idx + 1)
+                orig_idx += 1
+            elif tag == "+":
+                out_lines.append(content)
+                new_changed.add(len(out_lines))
+                # For pure insertions, also mark adjacent original lines
+                if orig_idx > 0:
+                    orig_changed.add(orig_idx)
+                if orig_idx < len(orig_lines):
+                    orig_changed.add(orig_idx + 1)
+            idx_h += 1
+
+    # Copy remaining lines after last hunk
+    while orig_idx < len(orig_lines):
+        out_lines.append(orig_lines[orig_idx])
+        orig_idx += 1
+
+    return "".join(out_lines), orig_changed, new_changed
+
+
+def has_coding_cookie(text: str) -> str | None:
+    lines = text.splitlines()[:2]
+    for ln in lines:
+        m = _CODING_RE.match(ln)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+@dataclass
+class PyEditInfo:
+    path: str
+    syntax_error: bool = False
+    ast_identical: bool = False
+    is_added_or_deleted: bool = False
+    # Enclosing statement lines in orig_ast for every modified line
+    stmt_lines: set[int] = field(default_factory=set)
+    # Enclosing function/method entry lines in orig_ast
+    func_entry_lines: set[int] = field(default_factory=set)
+    # Enclosing function names (qualnames inside file, e.g. "TestParser.test_foo" or "func")
+    enclosing_funcs: set[str] = field(default_factory=set)
+    # Class-level (outside method bodies) edited classes (qualnames inside file)
+    class_level_edits: set[str] = field(default_factory=set)
+    # Class-level attribute assignments edited: class_qualname -> set of attr names
+    class_attr_edits: dict[str, set[str]] = field(default_factory=dict)
+    # Class-level non-simple-attr edits (bases, decorators, method sigs, non-assign)
+    class_non_attr_edits: set[str] = field(default_factory=set)
+    # All enclosing classes (even if edit is inside method body)
+    enclosing_classes: set[str] = field(default_factory=set)
+    # Module-level edits (outside any class or function)
+    module_level_edit: bool = False
+    # Module-level edited symbol names (constants / functions / imports)
+    module_level_names: set[str] = field(default_factory=set)
+    # Whether lexical scoping inside an enclosing function changed
+    scope_changed_funcs: set[str] = field(default_factory=set)
+    # Raw orig changed lines
+    orig_changed_lines: set[int] = field(default_factory=set)
+
+
+def _node_span(node: ast.AST) -> tuple[int, int]:
+    start = getattr(node, "lineno", 0)
+    end = getattr(node, "end_lineno", start) or start
+    # Include decorators!
+    decs = getattr(node, "decorator_list", None)
+    if decs:
+        start = min(start, min(getattr(d, "lineno", start) for d in decs))
+    return start, end
+
+
+def _collect_local_bindings(fn_node: ast.AST) -> set[str]:
+    """Collect variables bound locally in a function (excluding nested defs/classes)."""
+    bound: set[str] = set()
+    stack = list(ast.iter_child_nodes(fn_node))
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(n.name)
+            continue
+        if isinstance(n, ast.Lambda):
+            continue
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            bound.add(n.id)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            bound.update(n.names)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for alias in n.names:
+                bound.add(alias.asname or alias.name.split(".")[0])
+        stack.extend(ast.iter_child_nodes(n))
+    return bound
+
+
+def analyze_python_edit(
+    path: str,
+    orig_text: str | None,
+    new_text: str | None,
+    orig_changed: set[int],
+    new_changed: set[int],
+) -> PyEditInfo:
+    info = PyEditInfo(path=path, orig_changed_lines=set(orig_changed))
+
+    if orig_text is None or new_text is None:
+        info.is_added_or_deleted = True
+        info.module_level_edit = True
+        if new_text is not None:
+            try:
+                ast.parse(new_text.encode("utf-8"), filename=path)
+            except (SyntaxError, ValueError):
+                info.syntax_error = True
+        return info
+
+    # Parse UTF-8 bytes so `# coding: ...` encoding cookies are enforced identically to Python's importer!
+    try:
+        new_ast = ast.parse(new_text.encode("utf-8"), filename=path)
+    except (SyntaxError, ValueError):
+        info.syntax_error = True
+        return info
+
+    try:
+        orig_ast = ast.parse(orig_text.encode("utf-8"), filename=path)
+    except (SyntaxError, ValueError):
+        info.module_level_edit = True
+        return info
+
+    # Check exact AST equivalence (ignoring line/col attributes) AND coding cookie
+    if (
+        has_coding_cookie(orig_text) == has_coding_cookie(new_text)
+        and ast.dump(orig_ast, include_attributes=False) == ast.dump(new_ast, include_attributes=False)
+    ):
+        info.ast_identical = True
+        return info
+
+    # Index functions & classes in both orig_ast and new_ast
+    orig_funcs: dict[str, ast.AST] = {}
+    new_funcs: dict[str, ast.AST] = {}
+    orig_classes: set[str] = set()
+
+    def index_ast(node: ast.AST, funcs_out: dict[str, ast.AST], classes_out: set[str] | None, prefix: str = "") -> None:
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                qn = f"{prefix}.{child.name}" if prefix else child.name
+                if classes_out is not None:
+                    classes_out.add(qn)
+                index_ast(child, funcs_out, classes_out, qn)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qn = f"{prefix}.{child.name}" if prefix else child.name
+                funcs_out[qn] = child
+                index_ast(child, funcs_out, classes_out, qn)
+
+    index_ast(orig_ast, orig_funcs, orig_classes)
+    index_ast(new_ast, new_funcs, None)
+
+    unchanged_funcs: set[str] = set()
+    for qn, ofn in orig_funcs.items():
+        nfn = new_funcs.get(qn)
+        if nfn is not None and ast.dump(ofn, include_attributes=False) == ast.dump(nfn, include_attributes=False):
+            unchanged_funcs.add(qn)
+
+    def _first_exec_line(fn_node: ast.AST) -> int | None:
+        for bstmt in getattr(fn_node, "body", []):
+            if (
+                isinstance(bstmt, ast.Expr)
+                and isinstance(bstmt.value, ast.Constant)
+                and isinstance(bstmt.value.value, str)
+            ):
+                continue
+            return bstmt.lineno
+        return None
+
+    orig_lambda_classes: set[str] = set()
+
+    # Walk orig_ast to find enclosing scopes for each changed line
+    def walk_scope(
+        body: list[ast.stmt],
+        class_stack: list[str],
+        func_stack: list[tuple[str, ast.AST]],
+    ) -> None:
+        for stmt in body:
+            s, e = _node_span(stmt)
+            # Check if any orig_changed line intersects [s, e]
+            hit_lines = [ln for ln in orig_changed if s <= ln <= e]
+            if not hit_lines:
+                continue
+
+            if isinstance(stmt, ast.ClassDef):
+                cname = ".".join(class_stack + [stmt.name])
+                info.enclosing_classes.add(cname)
+                # Check if header/decorators/bases edited or direct class body stmt edited
+                body_start = stmt.body[0].lineno if stmt.body else e
+                if any(ln < body_start for ln in hit_lines):
+                    info.class_level_edits.add(cname)
+                    info.class_non_attr_edits.add(cname)
+                # Recurse into class body
+                walk_scope(stmt.body, class_stack + [stmt.name], func_stack)
+                continue
+
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qn = ".".join(class_stack + [f[0] for f in func_stack] + [stmt.name])
+                if qn in unchanged_funcs:
+                    # Pure adjacent-line spill or comment inside unchanged function -> ignore!
+                    for ln in hit_lines:
+                        info.orig_changed_lines.discard(ln)
+                    continue
+                info.enclosing_funcs.add(qn)
+                # First EXECUTABLE statement inside function body (skip def header & docstring!)
+                first_ln = _first_exec_line(stmt)
+                if first_ln is not None:
+                    info.func_entry_lines.add(first_ln)
+                # Check if decorator/signature/defaults edited -> class/module level!
+                body_start = stmt.body[0].lineno if stmt.body else e
+                if any(ln < body_start for ln in hit_lines):
+                    if class_stack and not func_stack:
+                        cname = ".".join(class_stack)
+                        info.class_level_edits.add(cname)
+                        info.class_non_attr_edits.add(cname)
+                    elif not class_stack and not func_stack:
+                        info.module_level_edit = True
+                        info.module_level_names.add(stmt.name)
+                # Check if lexical bindings changed
+                if qn in new_funcs:
+                    if _collect_local_bindings(stmt) != _collect_local_bindings(new_funcs[qn]):
+                        info.scope_changed_funcs.add(qn)
+                walk_scope(stmt.body, class_stack, func_stack + [(stmt.name, stmt)])
+                continue
+
+            # Regular or compound statement
+            if not func_stack:
+                # We are at class level or module level!
+                if class_stack:
+                    cname = ".".join(class_stack)
+                    # Check if the edit is ONLY inside a lambda inside a class dict (like FUNCTIONS)
+                    inside_lambda = _find_enclosing_lambda(stmt, hit_lines)
+                    if inside_lambda is not None:
+                        ls, le = _node_span(inside_lambda)
+                        info.stmt_lines.update(range(ls, le + 1))
+                        orig_lambda_classes.add(cname)
+                        if any(ln < ls or ln > le for ln in hit_lines):
+                            info.class_level_edits.add(cname)
+                            info.class_non_attr_edits.add(cname)
+                    else:
+                        info.class_level_edits.add(cname)
+                        info.stmt_lines.update(range(s, e + 1))
+                        # Track simple attribute assignment name (e.g. WEEK_OFFSET = -1, SHOW_PARSERS = {...})
+                        attr_names: set[str] = set()
+                        if isinstance(stmt, ast.Assign) and all(isinstance(t, ast.Name) for t in stmt.targets):
+                            for t in stmt.targets:
+                                attr_names.add(t.id)
+                        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                            attr_names.add(stmt.target.id)
+                        if attr_names:
+                            info.class_attr_edits.setdefault(cname, set()).update(attr_names)
+                        else:
+                            info.class_non_attr_edits.add(cname)
+                else:
+                    info.module_level_edit = True
+                    info.stmt_lines.update(range(s, e + 1))
+                    _collect_assigned_names(stmt, info.module_level_names)
+                continue
+
+            # Inside a function body!
+            # Record enclosing function entry line & enclosing statement lines
+            if isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)):
+                # Check if edit is in the header/test vs inside a child body
+                child_bodies: list[list[ast.stmt]] = []
+                if hasattr(stmt, "body") and isinstance(stmt.body, list):
+                    child_bodies.append(stmt.body)
+                if hasattr(stmt, "orelse") and isinstance(stmt.orelse, list):
+                    child_bodies.append(stmt.orelse)
+                if hasattr(stmt, "finalbody") and isinstance(stmt.finalbody, list):
+                    child_bodies.append(stmt.finalbody)
+                if hasattr(stmt, "handlers"):
+                    for h in stmt.handlers:
+                        child_bodies.append(h.body)
+                if hasattr(stmt, "cases"):
+                    for c in stmt.cases:
+                        child_bodies.append(c.body)
+
+                # Header lines (before first body stmt, or condition lines)
+                first_body_ln = min((b[0].lineno for b in child_bodies if b), default=e + 1)
+                header_hits = [ln for ln in hit_lines if ln < first_body_ln]
+                if header_hits:
+                    # Condition/header edited -> include ALL header lines
+                    info.stmt_lines.update(range(s, min(first_body_ln, e + 1)))
+                for cb in child_bodies:
+                    if cb:
+                        cs = _node_span(cb[0])[0]
+                        ce = _node_span(cb[-1])[1]
+                        if any(cs <= ln <= ce for ln in hit_lines):
+                            walk_scope(cb, class_stack, func_stack)
+                # Also if hit line fell on `elif` / `else:` / `except:` header between bodies
+                for ln in hit_lines:
+                    info.stmt_lines.add(ln)
+                # Include the compound stmt's own start line (for short-circuit / branch flips!)
+                info.stmt_lines.add(s)
+            else:
+                # Leaf statement (Assign, Return, Expr, AugAssign, etc.) -> include full statement span!
+                info.stmt_lines.update(range(s, e + 1))
+
+    walk_scope(orig_ast.body, [], [])
+
+    # Also walk new_ast with new_changed to catch pure insertions at top-level, class-level, or brand-new methods!
+    def walk_new_scope(
+        body: list[ast.stmt],
+        class_stack: list[str],
+        func_stack: list[str],
+    ) -> None:
+        for stmt in body:
+            s, e = _node_span(stmt)
+            hit_lines = [ln for ln in new_changed if s <= ln <= e]
+            if not hit_lines:
+                continue
+
+            if isinstance(stmt, ast.ClassDef):
+                cname = ".".join(class_stack + [stmt.name])
+                info.enclosing_classes.add(cname)
+                body_start = stmt.body[0].lineno if stmt.body else e
+                if cname not in orig_classes or any(ln < body_start for ln in hit_lines):
+                    info.class_level_edits.add(cname)
+                    info.class_non_attr_edits.add(cname)
+                    if not class_stack and not func_stack:
+                        info.module_level_edit = True
+                        info.module_level_names.add(stmt.name)
+                walk_new_scope(stmt.body, class_stack + [stmt.name], func_stack)
+                continue
+
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qn = ".".join(class_stack + func_stack + [stmt.name])
+                if qn in unchanged_funcs:
+                    continue
+                info.enclosing_funcs.add(qn)
+                if qn not in orig_funcs:
+                    # Brand-new function or method override!
+                    if class_stack and not func_stack:
+                        cname = ".".join(class_stack)
+                        info.class_level_edits.add(cname)
+                        info.class_non_attr_edits.add(cname)
+                    elif not class_stack and not func_stack:
+                        info.module_level_edit = True
+                        info.module_level_names.add(stmt.name)
+                else:
+                    first_ln = _first_exec_line(orig_funcs[qn])
+                    if first_ln is not None:
+                        info.func_entry_lines.add(first_ln)
+                    body_start = stmt.body[0].lineno if stmt.body else e
+                    if any(ln < body_start for ln in hit_lines):
+                        if class_stack and not func_stack:
+                            cname = ".".join(class_stack)
+                            info.class_level_edits.add(cname)
+                            info.class_non_attr_edits.add(cname)
+                        elif not class_stack and not func_stack:
+                            info.module_level_edit = True
+                            info.module_level_names.add(stmt.name)
+                walk_new_scope(stmt.body, class_stack, func_stack + [stmt.name])
+                continue
+
+            if not func_stack:
+                if class_stack:
+                    cname = ".".join(class_stack)
+                    inside_lambda = _find_enclosing_lambda(stmt, hit_lines)
+                    if inside_lambda is not None and cname in orig_lambda_classes:
+                        continue
+                    info.class_level_edits.add(cname)
+                    attr_names: set[str] = set()
+                    if isinstance(stmt, ast.Assign) and all(isinstance(t, ast.Name) for t in stmt.targets):
+                        for t in stmt.targets:
+                            attr_names.add(t.id)
+                    elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                        attr_names.add(stmt.target.id)
+                    if attr_names:
+                        info.class_attr_edits.setdefault(cname, set()).update(attr_names)
+                    else:
+                        info.class_non_attr_edits.add(cname)
+                else:
+                    info.module_level_edit = True
+                    _collect_assigned_names(stmt, info.module_level_names)
+
+    walk_new_scope(new_ast.body, [], [])
+
+    # Safety: if a changed line was NOT inside any statement in orig_ast or new_ast, treat as module-level edit!
+    if not info.stmt_lines and not info.enclosing_funcs and not info.class_level_edits:
+        info.module_level_edit = True
+
+    return info
+
+
+def _find_enclosing_lambda(node: ast.AST, hit_lines: list[int]) -> ast.Lambda | None:
+    """If ALL hit_lines lie strictly inside a single ast.Lambda inside node, return that Lambda."""
+    best: ast.Lambda | None = None
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Lambda):
+            ls, le = _node_span(sub)
+            if all(ls <= ln <= le for ln in hit_lines):
+                if best is None or (le - ls) < (_node_span(best)[1] - _node_span(best)[0]):
+                    best = sub
+    return best
+
+
+def _collect_assigned_names(stmt: ast.stmt, out: set[str]) -> None:
+    if isinstance(stmt, ast.Assign):
+        for t in stmt.targets:
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name):
+                    out.add(n.id)
+    elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+        out.add(stmt.target.id)
+    elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        for a in stmt.names:
+            out.add(a.asname or a.name.split(".")[0])
+
+
+# --- SQL fixture parsing (exact mirror of tests/helpers.py) ---
+
+def _filter_sql_comments(s: str) -> str:
+    return "\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+
+
+def _extract_meta(sql: str) -> tuple[str, dict[str, str]]:
+    meta: dict[str, str] = {}
+    sql_lines = sql.split("\n")
+    i = 0
+    while i < len(sql_lines) and sql_lines[i].startswith("#"):
+        key, val = sql_lines[i].split(":", maxsplit=1)
+        meta[key.lstrip("#").strip()] = val.strip()
+        i += 1
+    return "\n".join(sql_lines[i:]), meta
+
+
+def parse_sql_fixture_pairs(text: str) -> list[tuple[dict[str, str], str, str]]:
+    statements = _filter_sql_comments(text).split(";")
+    size = len(statements)
+    pairs = []
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql = statements[i].strip()
+            sql, meta = _extract_meta(sql)
+            expected = statements[i + 1].strip()
+            pairs.append((meta, sql, expected))
+    return pairs
+
+
+def parse_sql_fixtures(text: str) -> list[str]:
+    items = []
+    lines = []
+    for line in _filter_sql_comments(text).splitlines():
+        lines.append(line)
+        if not line.startswith("#"):
+            items.append("\n".join(lines))
+            lines.clear()
+    return items
+
+
+def diff_sql_fixture_pairs(orig_text: str, new_text: str) -> list[tuple[dict[str, str], str, str]] | None:
+    """Return ONLY the changed/added pairs (in new_text) if pair count matches and diff is clean,
+    or None if the fixture is unchanged (empty list) vs malformed.
+    Returns [] if parsed pairs are 100% identical!
+    """
+    try:
+        orig_pairs = parse_sql_fixture_pairs(orig_text)
+        new_pairs = parse_sql_fixture_pairs(new_text)
+    except Exception:
+        return None  # Malformed metadata header -> must run full test (it will raise!)
+
+    if orig_pairs == new_pairs:
+        return []
+
+    orig_set = {(tuple(sorted(m.items())), s, e) for m, s, e in orig_pairs}
+    changed = [
+        (m, s, e)
+        for m, s, e in new_pairs
+        if (tuple(sorted(m.items())), s, e) not in orig_set
+    ]
+    if not changed:
+        # Only deletions? If pairs were deleted, tests might still pass (remaining pairs unchanged)
+        # Returning [] is safe ONLY if remaining pairs are identical and test doesn't assert count!
+        # To be safe, return None if deletions only.
+        return None
+    return changed
+
+
+def diff_sql_fixtures(orig_text: str, new_text: str) -> list[str] | None:
+    try:
+        orig_items = parse_sql_fixtures(orig_text)
+        new_items = parse_sql_fixtures(new_text)
+    except Exception:
+        return None
+    if orig_items == new_items:
+        return []
+    orig_set = set(orig_items)
+    changed = [it for it in new_items if it not in orig_set]
+    return changed if changed else None
