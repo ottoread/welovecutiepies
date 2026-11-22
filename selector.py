@@ -15,6 +15,10 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+import inmem_loader
+import optimizer_checkpoints as checkpointing
+import stress_slicing
+
 from inmem_loader import (
     EXECUTOR_OPTIONS,
     apply_hot_patches,
@@ -188,6 +192,8 @@ def _execute_job_in_child(
         direct_iteration=job.get("allow_direct_iteration", False),
         context_table_only=job.get("context_table_only", False),
     )
+    inmem_loader.OPTIMIZER_CHECKPOINTS_ENABLED = job.get("optimizer_checkpoints", False)
+    stress_skips = job.get("stress_skips", {})
 
     test_items: list[tuple[int, str]] = list(job["tests"])
     failing: list[int] = []
@@ -552,6 +558,7 @@ def _execute_job_in_child(
                 pure_executor_only=job.get("pure_executor_only", False),
                 patched_files=patched_files,
                 is_tier0=is_tier0,
+                stress_skip=stress_skips.get(tid),
             ):
                 failing.append(tnum)
         except _TestTimeout:
@@ -842,6 +849,7 @@ class BlastRadiusSelector:
         self.lazy_load_num = self.by_id.get(TEST_LAZY_LOAD)
 
         self.runner = ForkRunner()
+        self._stress_coverage: dict | None = None
         self._cal_state: tuple[float, float, int, float] = (400.0, 400.0, 10, 15.0)
         self._orig_cache: dict[str, str | None] = {}
         self._external_read_cache: dict[tuple[str, str], bool] = {}
@@ -1023,6 +1031,7 @@ class BlastRadiusSelector:
         tpcds_hit_counts: dict[int, int] = {}
         touched_dialect_names: set[str] | None = set()
         expr_class_edits: set[str] | None = set()
+        expr_arg_flags: dict[str, set[str]] = {}
         parser_max_nodes_touched = False
         allow_lambda_exec = True
         context_table_only = False
@@ -1034,6 +1043,7 @@ class BlastRadiusSelector:
         check_import_rels: list[str] = []
         has_binary_change = False
         can_hot_patch = True
+        function_bodies_only = True
         hot_patch_specs: list[tuple[str, str, list[str]]] = []
         single_inv_site: tuple[str, str, int, int] | None = None
         dict_narrow_exprs: set[str] | None = None
@@ -1109,14 +1119,18 @@ class BlastRadiusSelector:
                 patched_files[fp.old_path] = None
                 can_hot_patch = False
 
-            if (
-                can_hot_patch
+            body_edit = (
+                bool(edit.enclosing_funcs)
                 and not edit.syntax_error
                 and not edit.is_added_or_deleted
                 and not edit.module_level_edit
                 and not edit.class_level_edits
+                and fp.old_path == rel
+            )
+            function_bodies_only &= body_edit
+            if (
+                can_hot_patch and body_edit
                 and not edit.scope_changed_funcs
-                and edit.enclosing_funcs
                 and all(len(qn.split(".")) <= 2 for qn in edit.enclosing_funcs)
             ):
                 hot_patch_specs.append((rel, file_to_module(rel), sorted(edit.enclosing_funcs)))
@@ -1183,6 +1197,8 @@ class BlastRadiusSelector:
                     _fc = f"{_emod}:{_cn}"
                     if _fc in self.expr_to_tests:
                         expr_class_edits.add(_fc)
+                        if edit.class_attr_edits.get(_cn) == {"arg_types"} and _cn in edit.arg_flag_edits:
+                            expr_arg_flags[_fc] = edit.arg_flag_edits[_cn]
                     else:
                         expr_class_edits = None
                         break
@@ -1953,6 +1969,61 @@ class BlastRadiusSelector:
                 if not hits_rs:
                     skip_redshift_values_stress = True
 
+        stress_skips: dict[str, set[str]] = {}
+        flag_edits_only = (
+            expr_class_slice and expr_class_edits == expr_arg_flags.keys()
+            and len(real_code_files) == len(patched_files)
+            and all(rel.startswith("sqlglot/expressions/") for rel in patched_files)
+        )
+        if (
+            os.environ.get("BLAST_STRESS_SLICING", "1") != "0"
+            and not has_fixture_change
+            and len(real_code_files) == len(patched_files)
+            and ((function_bodies_only and can_slice_fixtures) or flag_edits_only)
+        ):
+            stress_tests = {
+                self.by_num[n]["id"] for n in normal_cands
+                if self.by_num[n]["id"] in stress_slicing.BLOCKS
+            }
+            can_narrow_tpcds_fixture = (
+                flag_edits_only and fixture_index_masks is not None
+                and stress_slicing.TPCDS_FIXTURE in fixture_index_masks
+            )
+            if stress_tests or can_narrow_tpcds_fixture:
+                if self._stress_coverage is None:
+                    self._stress_coverage = stress_slicing.load_map(APP_DIR / stress_slicing.STRESS_MAP_FILE)
+                if can_narrow_tpcds_fixture:
+                    flags_mask = stress_slicing.required_fixture_mask(self._stress_coverage, expr_arg_flags)
+                    if flags_mask is not None:
+                        fixture_index_masks[stress_slicing.TPCDS_FIXTURE] &= flags_mask
+                changed_lines = dict(py_hit_lines_for_fixtures)
+                for tid in stress_tests:
+                    skipped = stress_slicing.skipped_blocks(
+                        self._stress_coverage, tid, set() if flag_edits_only else set(patched_files),
+                        changed_lines, expr_arg_flags if flag_edits_only else None,
+                    )
+                    if skipped:
+                        stress_skips[tid] = skipped
+
+        optimizer_checkpoints = (
+            os.environ.get("BLAST_OPT_CHECKPOINTS", "1") != "0"
+            and function_bodies_only and can_slice_fixtures and not has_fixture_change
+            and bool(real_code_files)
+            and len(real_code_files) == len(patched_files)
+            and all(
+                rel.startswith(("sqlglot/optimizer/", "sqlglot/generators/"))
+                or rel == "sqlglot/generator.py"
+                for rel in real_code_files
+            )
+            and "sqlglot/optimizer/optimizer.py" not in patched_files
+        )
+        checkpoint_ratio = (
+            checkpointing.estimate_runtime_ratio(
+                APP_DIR / checkpointing.CHECKPOINT_FILE, set(patched_files)
+            )
+            if optimizer_checkpoints else 1.0
+        )
+
         # Server-calibrated verification CPU estimates (~2.8x slower single-core than Apple Silicon)
         _opt_test_to_fixture = {
             "test_tpcds": "optimizer/tpc-ds/tpc-ds.sql",
@@ -2107,6 +2178,34 @@ class BlastRadiusSelector:
             else:
                 verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * 0.85)
 
+        for tid, skipped in stress_skips.items():
+            n = self.by_id[tid]
+            if "*" in skipped:
+                verification_cpu_ms[n] = 15.0
+            elif tid == TEST_OPTIMIZER_SCOPE:
+                if skipped == {"many_unions", "chain"}:
+                    verification_cpu_ms[n] = 45.0
+                elif "many_unions" in skipped:
+                    verification_cpu_ms[n] = min(verification_cpu_ms[n], 220.0)
+            else:
+                verification_cpu_ms[n] *= 0.55
+
+        if checkpoint_ratio < 1.0:
+            for test_id in (
+                TEST_OPTIMIZER_TPCDS,
+                "tests/test_optimizer.py::TestOptimizer::test_tpch",
+                "tests/test_optimizer.py::TestOptimizer::test_optimize",
+            ):
+                n = self.by_id.get(test_id)
+                if n in verification_cpu_ms:
+                    verification_cpu_ms[n] = max(20.0, verification_cpu_ms[n] * checkpoint_ratio)
+            if self.tpcds_num in verification_cpu_ms and tpcds_fast_arg is not None:
+                verification_cpu_ms[self.tpcds_num] *= 0.4 + 0.6 * checkpoint_ratio
+            for method in checkpointing.DIRECT_OPTIMIZER_TESTS:
+                n = self.by_id.get(f"tests/test_optimizer.py::TestOptimizer::{method}")
+                if n in verification_cpu_ms:
+                    verification_cpu_ms[n] *= 0.4 + 0.6 * checkpoint_ratio
+
         probe_set: set[int] = set()
         if normal_cands:
             normal_est_total = sum(verification_cpu_ms.get(n, 0.0) for n in normal_cands)
@@ -2229,6 +2328,7 @@ class BlastRadiusSelector:
             allow_share_tpcds = bool(
                 opt_tpcds_num is not None
                 and opt_tpcds_cal_est <= 2600.0
+                and checkpoint_ratio == 1.0
             )
             job = {
                 "patched_files": patched_files,
@@ -2260,6 +2360,8 @@ class BlastRadiusSelector:
                 "allow_direct_iteration": allow_lambda_exec,
                 "pure_executor_only": pure_executor_only,
                 "allow_share_tpcds": allow_share_tpcds,
+                "optimizer_checkpoints": optimizer_checkpoints,
+                "stress_skips": stress_skips,
                 "context_table_only": context_table_only,
                 "tests": verify_list,
                 "probe_nums": probe_set,

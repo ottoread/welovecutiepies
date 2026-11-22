@@ -11,6 +11,9 @@ import sys
 import zlib
 from pathlib import Path
 
+import optimizer_checkpoints
+import stress_slicing
+
 SQLGLOT_ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/app/sqlglot")).resolve()
 APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SQLGLOT_ROOT))
@@ -207,6 +210,10 @@ def main() -> None:
     print(f"Built {out_dir} ({total_bytes / 1024:.1f} KB, {len(TPCDS_SCHEMA)} tables)", file=sys.stderr)
     _build_fast_plans()
     _build_executor_unit_plans()
+    optimizer_checkpoints.build_checkpoints(
+        SQLGLOT_ROOT, APP_DIR / optimizer_checkpoints.CHECKPOINT_FILE
+    )
+    stress_slicing.build_stress_map(SQLGLOT_ROOT, APP_DIR / stress_slicing.STRESS_MAP_FILE)
 
 
 if __name__ == "__main__":

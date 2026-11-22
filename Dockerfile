@@ -13,7 +13,7 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://github
     && mv /app/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa /app/sqlglot \
     && test -f /app/sqlglot/sqlglot/__init__.py
 
-COPY selector.py patch_utils.py worker_pack.py inmem_loader.py build_caches.py maps.zlib fixture_cov.zlib validator_cov.zlib db_query_cache.zlib invariants.zlib tpcds_plans.zlib opt_stages.zlib /app/
+COPY selector.py patch_utils.py worker_pack.py inmem_loader.py build_caches.py optimizer_checkpoints.py stress_slicing.py maps.zlib fixture_cov.zlib validator_cov.zlib db_query_cache.zlib invariants.zlib tpcds_plans.zlib opt_stages.zlib /app/
 
 # Precompile bytecode + pre-parse read-only TPC-DS tables & fast plans at build time (zero runtime CSV/serde cost)
 RUN SQLGLOT_ROOT=/app/sqlglot python /app/build_caches.py \

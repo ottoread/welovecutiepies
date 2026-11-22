@@ -227,6 +227,7 @@ class PyEditInfo:
     orig_changed_lines: set[int] = field(default_factory=set)
     # Dict-key diffs for class/module dict assignments: "Scope:ATTR" -> (changed_key_tags_or_None, keys_added_or_removed)
     dict_key_edits: dict[str, tuple[set[str] | None, bool]] = field(default_factory=dict)
+    arg_flag_edits: dict[str, set[str]] = field(default_factory=dict)
     # Exact runtime reads and the name to check for consumers outside this module.
     const_reader_lines: set[int] | None = None
     const_reader_symbol: str | None = None
@@ -709,6 +710,29 @@ def _analyze_dict_key_edits(orig_ast: ast.AST, new_ast: ast.AST, info: PyEditInf
         nd = new_dicts.get(tkey)
         if od is not None and nd is not None:
             info.dict_key_edits[tkey] = _diff_dict_nodes(od, nd)
+            if tkey.endswith(":arg_types"):
+                flags = _changed_arg_flags(od, nd)
+                if flags:
+                    info.arg_flag_edits[tkey.removesuffix(":arg_types")] = flags
+
+
+def _changed_arg_flags(old: ast.Dict, new: ast.Dict) -> set[str]:
+    if len(old.keys) != len(new.keys):
+        return set()
+    flags: set[str] = set()
+    for old_key, new_key, old_value, new_value in zip(old.keys, new.keys, old.values, new.values):
+        if old_key is None and new_key is None and _ast_equal(old_value, new_value):
+            continue
+        if (
+            not isinstance(old_key, ast.Constant) or type(old_key.value) is not str
+            or not isinstance(new_key, ast.Constant) or old_key.value != new_key.value
+            or not isinstance(old_value, ast.Constant) or type(old_value.value) is not bool
+            or not isinstance(new_value, ast.Constant) or type(new_value.value) is not bool
+        ):
+            return set()
+        if old_value.value != new_value.value:
+            flags.add(old_key.value)
+    return flags
 
 
 def _single_changed_statement(old_body, new_body):

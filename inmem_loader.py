@@ -25,6 +25,9 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+import optimizer_checkpoints
+import stress_slicing
+
 _POP_TOP = dis.opmap["POP_TOP"]
 _CACHE_OP = dis.opmap.get("CACHE", 0)
 _APP_DIR = Path(__file__).resolve().parent
@@ -879,6 +882,7 @@ def _install_dialect_validator_slicing(
 
 _EXACT_BASELINE_MATCH = object()
 _active_opt_sql_ctx: list[str | None] = [None]
+OPTIMIZER_CHECKPOINTS_ENABLED = False
 
 
 def _ast_fingerprint(root, exp_cls) -> bytes | None:
@@ -2110,6 +2114,7 @@ def install_optimizer_speedups(
     try:
         import functools
         import sqlglot.optimizer.optimizer as opt_mod
+        from sqlglot.schema import MappingSchema
     except BaseException:
         return
     if getattr(opt_mod, "_br_opt_patched", False):
@@ -2123,6 +2128,7 @@ def install_optimizer_speedups(
     ensure_schema = opt_mod.ensure_schema
     exp = opt_mod.exp
     ExprCls = exp.Expr
+    checkpoint_cache = None
 
     stage_fps: dict[bytes, tuple[bytes, ...]] | None = None
     final_sqls: dict[bytes, tuple[str, str | None, str | None]] | None = None
@@ -2178,8 +2184,10 @@ def install_optimizer_speedups(
         rules=RULES,
         sql=None,
         copy=True,
+        _checkpoint_sql=None,
         **kwargs,
     ):
+        nonlocal checkpoint_cache
         schema_obj = ensure_schema(schema, dialect=dialect)
         possible_kwargs = {
             "db": db,
@@ -2192,8 +2200,29 @@ def install_optimizer_speedups(
             **kwargs,
         }
         raw_sql = expression if isinstance(expression, str) else _active_opt_sql_ctx[0]
-        optimized = exp.maybe_parse(expression, dialect=dialect, copy=copy)
         leave_iso = bool(kwargs.get("leave_tables_isolated"))
+        checkpoint = None
+        cached_input = expression if isinstance(expression, str) else _checkpoint_sql
+        if (
+            OPTIMIZER_CHECKPOINTS_ENABLED
+            and cached_input is not None
+            and rules is RULES and copy and db is None and catalog is None and sql is None
+            and (dialect is None or isinstance(dialect, str))
+            and type(schema_obj) is MappingSchema
+            and not (kwargs.keys() - {"leave_tables_isolated"})
+        ):
+            if checkpoint_cache is None:
+                checkpoint_cache = optimizer_checkpoints.load_for_patch(
+                    _APP_DIR / optimizer_checkpoints.CHECKPOINT_FILE, set(patched_files)
+                )
+            key = optimizer_checkpoints.query_key(cached_input, schema_obj, dialect, leave_iso)
+            checkpoint = checkpoint_cache.get(key)
+        if checkpoint is None:
+            start = 0
+            optimized = exp.maybe_parse(expression, dialect=dialect, copy=copy)
+        else:
+            start, checkpoint_data = checkpoint
+            optimized = pickle.loads(checkpoint_data)
         can_early = (
             early_stage is not None
             and raw_sql is not None
@@ -2206,14 +2235,16 @@ def install_optimizer_speedups(
             else None
         )
 
-        if can_early and early_stage == -1:
+        if can_early and early_stage == -1 and start == 0:
             hit = _try_early_exit(optimized, raw_sql, schema_obj, dialect, db, catalog, leave_iso, -1)
             if hit is not None:
                 if capture_key is not None:
                     tpcds_pre_merge[capture_key] = _EXACT_BASELINE_MATCH
                 return hit
 
-        for idx_r, rule in enumerate(rules):
+        if capture_key is not None and start == 7:
+            tpcds_pre_merge[capture_key] = optimized.copy()
+        for idx_r, rule in enumerate(rules[start:] if start else rules, start):
             rule_params = cached_args(rule)
             rule_kwargs = {
                 param: possible_kwargs[param] for param in rule_params if param in possible_kwargs
@@ -2375,6 +2406,7 @@ def run_test_in_process(
     pure_executor_only: bool = False,
     patched_files: dict[str, str | None] | None = None,
     is_tier0: bool = False,
+    stress_skip: set[str] | None = None,
 ) -> bool:
     """Run a single unittest test_id in-process with fail-fast.
 
@@ -2439,7 +2471,7 @@ def run_test_in_process(
                 pass
             mod.wait = lambda futs: None
             mod.as_completed = lambda futs: iter(futs)
-            if tpcds_pre_merge is not None or early_stage is not None:
+            if tpcds_pre_merge is not None or early_stage is not None or OPTIMIZER_CHECKPOINTS_ENABLED:
                 orig_pao = mod.parse_and_optimize
 
                 def _tracking_pao(func, sql, read_dialect, **kwargs):
@@ -2449,6 +2481,14 @@ def run_test_in_process(
                     if want_tpcds:
                         tpcds_pre_merge["__active_sql__"] = sql
                     try:
+                        if (
+                            OPTIMIZER_CHECKPOINTS_ENABLED and func is mod.optimize
+                            and read_dialect == kwargs.get("dialect")
+                        ):
+                            return orig_pao(
+                                lambda expr, **opts: func(expr, _checkpoint_sql=sql, **opts),
+                                sql, read_dialect, **kwargs,
+                            )
                         return orig_pao(func, sql, read_dialect, **kwargs)
                     finally:
                         _active_opt_sql_ctx[0] = prev_sql
@@ -2676,6 +2716,11 @@ def run_test_in_process(
 
     try:
         case = cls(method_name)
+        if stress_skip:
+            method = getattr(cls, method_name)
+            if method.__name__ == method_name:
+                sliced = stress_slicing.slice_method(method, stress_skip)
+                setattr(case, method_name, sliced.__get__(case, cls))
         result = _FailFastResult()
         case.run(result)
         return not result.wasSuccessful()
@@ -3303,7 +3348,13 @@ def verify_execute_tpcds_fast(
                         _active_opt_sql_ctx[0] = None if need_duck else sql
                         try:
                             expr = parse_one(sql)
-                            opt = optimize(expr.copy(), schema=tpcds_schema_obj, leave_tables_isolated=True)
+                            checkpoint_args = (
+                                {"_checkpoint_sql": sql} if OPTIMIZER_CHECKPOINTS_ENABLED else {}
+                            )
+                            opt = optimize(
+                                expr.copy(), schema=tpcds_schema_obj, leave_tables_isolated=True,
+                                **checkpoint_args,
+                            )
                         finally:
                             _active_opt_sql_ctx[0] = prev_sql
                         h = hashlib.sha256(opt.sql().encode("utf-8")).hexdigest()[:16]

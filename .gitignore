@@ -5,3 +5,6 @@ tpcds_tables.pkl
 tpcds_tables/
 tpcds_plans_fast/
 executor_unit_plans.pkl
+optimizer_checkpoints.zlib
+optimizer_checkpoints.index
+stress_blocks.zlib
