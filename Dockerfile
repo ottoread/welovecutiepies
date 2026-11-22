@@ -13,10 +13,11 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://github
     && mv /app/sqlglot-eb11aec4be8cb2122afe713a4816662c3f0fb2fa /app/sqlglot \
     && test -f /app/sqlglot/sqlglot/__init__.py
 
-COPY selector.py patch_utils.py worker_pack.py inmem_loader.py maps.zlib fixture_cov.zlib tpcds_plans.zlib opt_stages.zlib /app/
+COPY selector.py patch_utils.py worker_pack.py inmem_loader.py build_caches.py maps.zlib fixture_cov.zlib tpcds_plans.zlib opt_stages.zlib /app/
 
-# Precompile bytecode for fast cold imports on read-only rootfs and ensure world-readable for nobody (65534)
-RUN python -m compileall -q /app/sqlglot/sqlglot /app/sqlglot/tests /app/sqlglot/sqlglotc /app/*.py \
+# Precompile bytecode + pre-parse read-only TPC-DS tables at build time (zero runtime CSV cost)
+RUN SQLGLOT_ROOT=/app/sqlglot python /app/build_caches.py \
+    && python -m compileall -q /app/sqlglot/sqlglot /app/sqlglot/tests /app/sqlglot/sqlglotc /app/*.py \
     && chmod -R a+rX /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

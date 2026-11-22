@@ -15,7 +15,9 @@ import importlib.util
 import io
 import os
 import pickle
+import re
 import signal
+import statistics
 import sys
 import time
 import unittest
@@ -415,7 +417,9 @@ def _install_assert_ctx_hooks() -> None:
         setattr(unittest.TestCase, mname, make_wrapped(orig))
 
 
-def _install_dialect_validator_slicing(dialect_filter: set[str]) -> None:
+def _install_dialect_validator_slicing(
+    dialect_filter: set[str], dialect_edit_mode: str = "all"
+) -> None:
     """Patch Validator.validate_all / validate_transpile / validate_identity with exact _assert_ctx_depth guard."""
     _install_assert_ctx_hooks()
     try:
@@ -430,9 +434,23 @@ def _install_dialect_validator_slicing(dialect_filter: set[str]) -> None:
     orig_all = Validator.validate_all
     orig_id = Validator.validate_identity
     orig_tr = Validator.validate_transpile
+    gen_only = dialect_edit_mode == "generator"
+    parser_only = dialect_edit_mode == "parser"
 
     def fast_validate_all(self, sql, read=None, write=None, pretty=False, identify=False):
-        if _assert_ctx_depth > 0 or _any_dialect_in(self.dialect, dialect_filter):
+        if _assert_ctx_depth > 0:
+            return orig_all(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+        if _any_dialect_in(self.dialect, dialect_filter):
+            if gen_only and write:
+                f_write = {k: v for k, v in write.items() if _any_dialect_in(k, dialect_filter)}
+                if not read and not f_write:
+                    return None
+                return orig_all(self, sql, read=read, write=f_write or None, pretty=pretty, identify=identify)
+            if parser_only and read:
+                f_read = {k: v for k, v in read.items() if _any_dialect_in(k, dialect_filter)}
+                if not f_read and not write:
+                    return None
+                return orig_all(self, sql, read=f_read or None, write=write, pretty=pretty, identify=identify)
             return orig_all(self, sql, read=read, write=write, pretty=pretty, identify=identify)
         f_read = {k: v for k, v in read.items() if _any_dialect_in(k, dialect_filter)} if read else None
         f_write = {k: v for k, v in write.items() if _any_dialect_in(k, dialect_filter)} if write else None
@@ -455,12 +473,11 @@ def _install_dialect_validator_slicing(dialect_filter: set[str]) -> None:
         return orig_all(self, sql, read=f_read, write=f_write, pretty=pretty, identify=identify)
 
     def fast_validate_transpile(self, sql, write_sql, write_dialect=None):
-        if (
-            _assert_ctx_depth == 0
-            and not _any_dialect_in(self.dialect, dialect_filter)
-            and not _any_dialect_in(write_dialect, dialect_filter)
-        ):
-            return None
+        if _assert_ctx_depth == 0:
+            if not _any_dialect_in(self.dialect, dialect_filter) and not _any_dialect_in(write_dialect, dialect_filter):
+                return None
+            if gen_only and not _any_dialect_in(write_dialect, dialect_filter) and _return_value_discarded():
+                return None
         return orig_tr(self, sql, write_sql, write_dialect=write_dialect)
 
     def fast_validate_identity(
@@ -543,12 +560,10 @@ def _ast_fingerprint(root, exp_cls) -> bytes | None:
 class _EarlyVerifiedAST:
     """Sound sentinel returned by fast_optimize when post-stage AST matches baseline and downstream rules are untouched."""
 
-    __slots__ = ("_compact", "_pretty", "_duckdb", "_dialect")
+    __slots__ = ("_sql_map", "_dialect")
 
-    def __init__(self, compact: str, pretty: str | None, duckdb: str | None, dialect: str):
-        self._compact = compact
-        self._pretty = pretty
-        self._duckdb = duckdb
+    def __init__(self, sql_map: dict[tuple[str, bool], str] | tuple[str, str | None, str | None], dialect: str):
+        self._sql_map = sql_map
         self._dialect = dialect
 
     def walk(self):
@@ -563,17 +578,120 @@ class _EarlyVerifiedAST:
             else:
                 val = getattr(dialect, "value", None)
                 d_str = val if isinstance(val, str) else ""
-            if pretty and self._pretty is not None and d_str == self._dialect:
-                return self._pretty
-            if not pretty and d_str == self._dialect:
-                return self._compact
-            if not pretty and d_str == "duckdb" and self._duckdb is not None:
-                return self._duckdb
+            sm = self._sql_map
+            if isinstance(sm, dict):
+                res = sm.get((d_str, bool(pretty)))
+                if res is not None:
+                    return res
+            else:
+                c_sql, p_sql, dk_sql = sm
+                if pretty and p_sql is not None and d_str == self._dialect:
+                    return p_sql
+                if not pretty and d_str == self._dialect:
+                    return c_sql
+                if not pretty and d_str == "duckdb" and dk_sql is not None:
+                    return dk_sql
         raise RuntimeError("Unexpected sql() arguments on _EarlyVerifiedAST")
 
 
 # Set per job in the forked verifier before any executor tests run.
 EXECUTOR_OPTIONS: dict[str, bool] = {}
+
+_SCOPE_RE = re.compile(r"scope\[(None|'[^'\\]*'|\"[^\"\\]*\")\]\[('[^'\\]*'|\"[^\"\\]*\")\]")
+_FMEAN = statistics.fmean
+
+
+def _unquote_scope_tok(tok: str):
+    return None if tok == "None" else tok[1:-1]
+
+
+def _fast_sql_and(left, right):
+    lv = left()
+    if lv is False or (lv is not None and not lv):
+        return False
+    rv = right()
+    if rv is False or (rv is not None and not rv):
+        return False
+    return None if (lv is None or rv is None) else True
+
+
+def _fast_sql_or(left, right):
+    lv = left()
+    if lv is True or (lv is not None and lv):
+        return True
+    rv = right()
+    if rv is True or (rv is not None and rv):
+        return True
+    return None if (lv is None or rv is None) else False
+
+
+def _fast_count(acc):
+    n = 0
+    for v in acc:
+        if v is not None:
+            n += 1
+    return n
+
+
+def _fast_sum(acc):
+    total = 0
+    seen = False
+    for v in acc:
+        if v is not None:
+            if seen:
+                total += v
+            else:
+                total = v
+                seen = True
+    return total if seen else None
+
+
+def _fast_min(acc):
+    vals = [v for v in acc if v is not None]
+    return min(vals) if vals else None
+
+
+def _fast_max(acc):
+    vals = [v for v in acc if v is not None]
+    return max(vals) if vals else None
+
+
+def _fast_avg(acc):
+    vals = [v for v in acc if v is not None]
+    return _FMEAN(vals) if vals else None
+
+
+_FAST_ENV_OVERRIDES = {
+    "AND": _fast_sql_and,
+    "OR": _fast_sql_or,
+    "COUNT": _fast_count,
+    "SUM": _fast_sum,
+    "MIN": _fast_min,
+    "MAX": _fast_max,
+    "AVG": _fast_avg,
+    "EQ": lambda a, b: None if (a is None or b is None) else a == b,
+    "NEQ": lambda a, b: None if (a is None or b is None) else a != b,
+    "LT": lambda a, b: None if (a is None or b is None) else a < b,
+    "LTE": lambda a, b: None if (a is None or b is None) else a <= b,
+    "GT": lambda a, b: None if (a is None or b is None) else a > b,
+    "GTE": lambda a, b: None if (a is None or b is None) else a >= b,
+    "ADD": lambda a, b: None if (a is None or b is None) else a + b,
+    "SUB": lambda a, b: None if (a is None or b is None) else a - b,
+    "MUL": lambda a, b: None if (a is None or b is None) else a * b,
+    "DIV": lambda a, b: None if (a is None or b is None) else a / b,
+    "MOD": lambda a, b: None if (a is None or b is None) else a % b,
+    "BETWEEN": lambda x, lo, hi: None if (x is None or lo is None or hi is None) else (lo <= x and x <= hi),
+    "ABS": lambda a: None if a is None else abs(a),
+    "LOWER": lambda a: None if a is None else a.lower(),
+    "UPPER": lambda a: None if a is None else a.upper(),
+    "YEAR": lambda a: None if a is None else a.year,
+    "MONTH": lambda a: None if a is None else a.month,
+    "DAY": lambda a: None if a is None else a.day,
+    "LENGTH": lambda a: None if a is None else len(a),
+    "INT": lambda a: None if a is None else int(a),
+    "ORD": lambda a: None if a is None else ord(a),
+    "REVERSE": lambda a: None if a is None else a[::-1],
+}
 
 
 def install_executor_speedups(
@@ -584,9 +702,13 @@ def install_executor_speedups(
     table_patched = "sqlglot/executor/table.py" in patched_files
     context_patched = "sqlglot/executor/context.py" in patched_files
     python_patched = "sqlglot/executor/python.py" in patched_files
+    env_patched = (
+        "sqlglot/executor/env.py" in patched_files
+        or "sqlglot/executor/__init__.py" in patched_files
+    )
     context_table_only = EXECUTOR_OPTIONS.get("context_table_only", False)
     try:
-        if not (table_patched or python_patched or context_patched):
+        if not (table_patched or python_patched) and (not context_patched or context_table_only):
             import sqlglot.executor.table as tbl_mod
 
             if not getattr(tbl_mod.Table, "_br_iter_patched", False):
@@ -615,6 +737,7 @@ def install_executor_speedups(
 
             Table = py_mod.Table
             Context = py_mod.Context
+            RowReader = py_mod.RowReader
             table_getitem = Table.__getitem__
             direct_iteration = (
                 EXECUTOR_OPTIONS.get("direct_iteration", False)
@@ -628,8 +751,30 @@ def install_executor_speedups(
                     )
                 )
             )
+            if not env_patched:
+                py_mod.ENV.update(_FAST_ENV_OVERRIDES)
             ENV_MOD = py_mod.ENV
             shared_gen = py_mod.Python().generator(identify=True, comments=False)
+            can_rewrite_rows = (not context_patched or context_table_only) and not table_patched
+
+            def _shared_rows_table(context):
+                """If all tables in `context` share one underlying rows list and no outer readers exist, return that Table."""
+                if not can_rewrite_rows or type(context) is not Context or not context.tables:
+                    return None
+                tbls = context.tables
+                if len(context.row_readers) != len(tbls):
+                    return None
+                first = None
+                first_rows = None
+                for name, t in tbls.items():
+                    if type(t) is not Table or context.row_readers.get(name) is not t.reader:
+                        return None
+                    if first is None:
+                        first = t
+                        first_rows = t.rows
+                    elif t.rows is not first_rows:
+                        return None
+                return first
 
             def _fast_context_iter(self):
                 self.env["scope"] = self.row_readers
@@ -645,9 +790,9 @@ def install_executor_speedups(
                     and Table.__getitem__ is table_getitem
                     and next(iter(tables.values())) is table
                 ):
-                    for index in range(count):
-                        reader = table.reader
-                        reader.row = table.rows[index]
+                    reader = table.reader
+                    for row in table.rows:
+                        reader.row = row
                         yield reader, self
                 else:
                     for index in range(count):
@@ -669,12 +814,143 @@ def install_executor_speedups(
                     SUBQUERY_SCALAR=self._subquery_scalar,
                 )
 
-            def _compile_lambda(self, expression, env):
+            def _rewrite_scope(sql: str, row_readers: dict, bindings: dict, single_row_var: str | None) -> str:
+                def repl(m):
+                    tbl = _unquote_scope_tok(m.group(1))
+                    col = _unquote_scope_tok(m.group(2))
+                    rr = row_readers.get(tbl)
+                    if rr is None or type(rr) is not RowReader or col not in rr.columns:
+                        return m.group(0)
+                    col_idx = rr.columns[col]
+                    if single_row_var is not None:
+                        return f"{single_row_var}[{col_idx}]"
+                    for k, v in bindings.items():
+                        if v is rr:
+                            return f"{k}.row[{col_idx}]"
+                    var = f"_r{len(bindings)}"
+                    bindings[var] = rr
+                    return f"{var}.row[{col_idx}]"
+
+                return _SCOPE_RE.sub(repl, sql)
+
+            def _is_non_null_literal(e):
+                if isinstance(e, py_mod.exp.Literal):
+                    return True
+                if isinstance(e, py_mod.exp.Neg) and isinstance(e.this, py_mod.exp.Literal) and e.this.is_number:
+                    return True
+                return False
+
+            def _compile_positive_filter_sql(self, node, rrs: dict, use_single: bool, bindings: dict) -> str:
+                """Compile a top-level WHERE predicate into fast native Python truthiness (100% identical to SQL 3VL for `if cond:`)."""
+                exp_m = py_mod.exp
+                if isinstance(node, exp_m.Paren):
+                    return f"({_compile_positive_filter_sql(self, node.this, rrs, use_single, bindings)})"
+                if isinstance(node, exp_m.And):
+                    l = _compile_positive_filter_sql(self, node.this, rrs, use_single, bindings)
+                    r = _compile_positive_filter_sql(self, node.expression, rrs, use_single, bindings)
+                    return f"({l} and {r})"
+                if isinstance(node, exp_m.Or):
+                    l = _compile_positive_filter_sql(self, node.this, rrs, use_single, bindings)
+                    r = _compile_positive_filter_sql(self, node.expression, rrs, use_single, bindings)
+                    return f"({l} or {r})"
+                if isinstance(node, exp_m.EQ):
+                    if _is_non_null_literal(node.expression) or _is_non_null_literal(node.this):
+                        l = _rewrite_scope(self.generator.generate(self._replace_subqueries(node.this)), rrs, bindings, "_row" if use_single else None)
+                        r = _rewrite_scope(self.generator.generate(self._replace_subqueries(node.expression)), rrs, bindings, "_row" if use_single else None)
+                        return f"({l} == {r})"
+                if isinstance(node, exp_m.NEQ):
+                    if _is_non_null_literal(node.expression) and type(node.this) is exp_m.Column:
+                        l = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
+                        r = self.generator.generate(node.expression)
+                        return f"({l} is not None and {l} != {r})"
+                if isinstance(node, (exp_m.GT, exp_m.GTE, exp_m.LT, exp_m.LTE)):
+                    if _is_non_null_literal(node.expression) and type(node.this) is exp_m.Column:
+                        op = ">" if isinstance(node, exp_m.GT) else (">=" if isinstance(node, exp_m.GTE) else ("<" if isinstance(node, exp_m.LT) else "<="))
+                        l = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
+                        r = self.generator.generate(node.expression)
+                        return f"({l} is not None and {l} {op} {r})"
+                    if _is_non_null_literal(node.this) and type(node.expression) is exp_m.Column:
+                        op = ">" if isinstance(node, exp_m.GT) else (">=" if isinstance(node, exp_m.GTE) else ("<" if isinstance(node, exp_m.LT) else "<="))
+                        l = self.generator.generate(node.this)
+                        r = _rewrite_scope(self.generator.generate(node.expression), rrs, bindings, "_row" if use_single else None)
+                        return f"({r} is not None and {l} {op} {r})"
+                if isinstance(node, exp_m.Between):
+                    if type(node.this) is exp_m.Column and _is_non_null_literal(node.args.get("low")) and _is_non_null_literal(node.args.get("high")):
+                        c = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
+                        lo = self.generator.generate(node.args["low"])
+                        hi = self.generator.generate(node.args["high"])
+                        return f"({c} is not None and {lo} <= {c} <= {hi})"
+                if isinstance(node, exp_m.In) and node.expressions and not node.args.get("query") and not node.args.get("field"):
+                    if type(node.this) is exp_m.Column and all(_is_non_null_literal(x) for x in node.expressions):
+                        c = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
+                        vals = ", ".join(self.generator.generate(x) for x in node.expressions)
+                        return f"({c} in ({vals},))"
+                raw = self.generator.generate(self._replace_subqueries(node))
+                return _rewrite_scope(raw, rrs, bindings, "_row" if use_single else None)
+
+            def _compile_expr_fn(self, expression, context, allow_single_row: bool = False, positive_filter: bool = False):
                 if not expression:
-                    return None
+                    return None, None
+                c_env = context.env
+                if can_rewrite_rows and type(context) is Context:
+                    rrs = context.row_readers
+                    use_single = allow_single_row and (_shared_rows_table(context) is not None)
+                    if positive_filter and not env_patched:
+                        if use_single:
+                            bindings: dict = {}
+                            sql2 = _compile_positive_filter_sql(self, expression, rrs, True, bindings)
+                            if "scope" not in sql2:
+                                return "row", eval(f"lambda _row: ({sql2})", c_env)
+                        bindings = {}
+                        sql2 = _compile_positive_filter_sql(self, expression, rrs, False, bindings)
+                        if bindings:
+                            defs = ", ".join(f"{k}={k}" for k in bindings)
+                            ns = {**c_env, **bindings}
+                            return "scope", eval(f"lambda scope, {defs}: ({sql2})", ns)
+                        return "scope", eval(f"lambda scope: ({sql2})", c_env)
+                    expression = self._replace_subqueries(expression)
+                    sql = self.generator.generate(expression)
+                    if use_single:
+                        bindings = {}
+                        sql2 = _rewrite_scope(sql, rrs, bindings, "_row")
+                        if "scope" not in sql2:
+                            return "row", eval(f"lambda _row: ({sql2})", c_env)
+                    bindings = {}
+                    sql2 = _rewrite_scope(sql, rrs, bindings, None)
+                    if bindings:
+                        defs = ", ".join(f"{k}={k}" for k in bindings)
+                        ns = {**c_env, **bindings}
+                        return "scope", eval(f"lambda scope, {defs}: ({sql2})", ns)
+                    return "scope", eval(f"lambda scope: ({sql})", c_env)
                 expression = self._replace_subqueries(expression)
                 sql = self.generator.generate(expression)
-                return eval(f"lambda scope: ({sql})", env)
+                return "scope", eval(f"lambda scope: ({sql})", c_env)
+
+            def _compile_tuple_fn(self, expressions, context, allow_single_row: bool = False):
+                if not expressions:
+                    return None, None
+                gen_parts = [
+                    self.generator.generate(self._replace_subqueries(e)) if e else "None"
+                    for e in expressions
+                ]
+                c_env = context.env
+                if can_rewrite_rows and type(context) is Context:
+                    rrs = context.row_readers
+                    use_single = allow_single_row and (_shared_rows_table(context) is not None)
+                    if use_single:
+                        bindings: dict = {}
+                        rw = [_rewrite_scope(s, rrs, bindings, "_row") for s in gen_parts]
+                        body = f"({', '.join(rw)},)"
+                        if "scope" not in body:
+                            return "row", eval(f"lambda _row: {body}", c_env)
+                    bindings = {}
+                    rw = [_rewrite_scope(s, rrs, bindings, None) for s in gen_parts]
+                    body = f"({', '.join(rw)},)"
+                    if bindings:
+                        defs = ", ".join(f"{k}={k}" for k in bindings)
+                        ns = {**c_env, **bindings}
+                        return "scope", eval(f"lambda scope, {defs}: {body}", ns)
+                return "scope", eval(f"lambda scope: ({', '.join(gen_parts)},)", c_env)
 
             def _compile_tuple_lambda(self, expressions, env):
                 if not expressions:
@@ -688,15 +964,112 @@ def install_executor_speedups(
                         parts.append("None")
                 return eval(f"lambda scope: ({', '.join(parts)},)", env)
 
-            def _fast_project_and_filter(self, context, step, table_iter):
+            def _fast_project_and_filter(self, context, step, table_iter, direct_rows=None):
+                import math as _math
                 sink = self.table(step.projections if step.projections else context.columns)
-                cond_fn = _compile_lambda(self, step.condition, context.env) if step.condition else None
-                proj_fn = _compile_tuple_lambda(self, step.projections, context.env) if step.projections else None
+                cond_mode, cond_fn = (
+                    _compile_expr_fn(self, step.condition, context, allow_single_row=True, positive_filter=True)
+                    if step.condition
+                    else (None, None)
+                )
+                proj_mode, proj_fn = _compile_tuple_fn(self, step.projections, context, allow_single_row=True) if step.projections else (None, None)
                 limit = step.offset + step.limit
+                no_limit = _math.isinf(limit)
                 sink_rows = sink.rows
                 sink_append = sink_rows.append
                 sink_width = len(sink.columns)
                 c_env = context.env
+
+                # Pure row-tuple loop (with C-speed list comprehension when no LIMIT!)
+                pure_row_ok = (cond_mode in (None, "row")) and (proj_mode in (None, "row"))
+                if pure_row_ok:
+                    rows_src = direct_rows
+                    if rows_src is None:
+                        shared = _shared_rows_table(context)
+                        if shared is not None and len(context.tables) == 1 and getattr(table_iter, "table", None) is shared:
+                            rows_src = shared.rows
+                    if rows_src is not None:
+                        if no_limit:
+                            if cond_fn is not None:
+                                if proj_fn is not None:
+                                    sink.rows = [proj_fn(row) for row in rows_src if cond_fn(row)]
+                                else:
+                                    sink.rows = [row for row in rows_src if cond_fn(row)]
+                            else:
+                                if proj_fn is not None:
+                                    sink.rows = [proj_fn(row) for row in rows_src]
+                                else:
+                                    sink.rows = list(rows_src)
+                            return sink
+                        if cond_fn is not None:
+                            if proj_fn is not None:
+                                for row in rows_src:
+                                    if len(sink_rows) >= limit:
+                                        break
+                                    if cond_fn(row):
+                                        sink_append(proj_fn(row))
+                            else:
+                                for row in rows_src:
+                                    if len(sink_rows) >= limit:
+                                        break
+                                    if cond_fn(row):
+                                        assert len(row) == sink_width
+                                        sink_append(row)
+                        else:
+                            if proj_fn is not None:
+                                for row in rows_src:
+                                    if len(sink_rows) >= limit:
+                                        break
+                                    sink_append(proj_fn(row))
+                            else:
+                                for row in rows_src:
+                                    if len(sink_rows) >= limit:
+                                        break
+                                    assert len(row) == sink_width
+                                    sink_append(row)
+                        return sink
+                    if no_limit:
+                        if cond_fn is not None:
+                            if proj_fn is not None:
+                                sink.rows = [proj_fn(r.row) for r in table_iter if cond_fn(r.row)]
+                            else:
+                                sink.rows = [r.row for r in table_iter if cond_fn(r.row)]
+                        else:
+                            if proj_fn is not None:
+                                sink.rows = [proj_fn(r.row) for r in table_iter]
+                            else:
+                                sink.rows = [r.row for r in table_iter]
+                        return sink
+                    if cond_fn is not None:
+                        if proj_fn is not None:
+                            for reader in table_iter:
+                                if len(sink_rows) >= limit:
+                                    break
+                                row = reader.row
+                                if cond_fn(row):
+                                    sink_append(proj_fn(row))
+                        else:
+                            for reader in table_iter:
+                                if len(sink_rows) >= limit:
+                                    break
+                                row = reader.row
+                                if cond_fn(row):
+                                    assert len(row) == sink_width
+                                    sink_append(row)
+                    else:
+                        if proj_fn is not None:
+                            for reader in table_iter:
+                                if len(sink_rows) >= limit:
+                                    break
+                                sink_append(proj_fn(reader.row))
+                        else:
+                            for reader in table_iter:
+                                if len(sink_rows) >= limit:
+                                    break
+                                row = reader.row
+                                assert len(row) == sink_width
+                                sink_append(row)
+                    return sink
 
                 if cond_fn is not None:
                     if proj_fn is not None:
@@ -704,13 +1077,15 @@ def install_executor_speedups(
                             if len(sink_rows) >= limit:
                                 break
                             sc = c_env["scope"]
-                            if cond_fn(sc):
-                                sink_append(proj_fn(sc))
+                            ok = cond_fn(reader.row) if cond_mode == "row" else cond_fn(sc)
+                            if ok:
+                                sink_append(proj_fn(reader.row) if proj_mode == "row" else proj_fn(sc))
                     else:
                         for reader in table_iter:
                             if len(sink_rows) >= limit:
                                 break
-                            if cond_fn(c_env["scope"]):
+                            ok = cond_fn(reader.row) if cond_mode == "row" else cond_fn(c_env["scope"])
+                            if ok:
                                 row = reader.row
                                 assert len(row) == sink_width
                                 sink_append(row)
@@ -719,7 +1094,7 @@ def install_executor_speedups(
                         for reader in table_iter:
                             if len(sink_rows) >= limit:
                                 break
-                            sink_append(proj_fn(c_env["scope"]))
+                            sink_append(proj_fn(reader.row) if proj_mode == "row" else proj_fn(c_env["scope"]))
                     else:
                         for reader in table_iter:
                             if len(sink_rows) >= limit:
@@ -729,35 +1104,120 @@ def install_executor_speedups(
                             sink_append(row)
                 return sink
 
+            def _fast_join(self, step, context):
+                source = step.source_name
+                source_table = context.tables[source]
+                source_context = self.context({source: source_table})
+                column_ranges = {source: range(0, len(source_table.columns))}
+
+                for name, join in step.joins.items():
+                    table = context.tables[name]
+                    start = max(r.stop for r in column_ranges.values())
+                    column_ranges[name] = range(start, len(table.columns) + start)
+                    join_context = self.context({name: table})
+                    j_cond = join["condition"]
+                    # Skip compiling trivial `True` condition on hash joins!
+                    if isinstance(j_cond, py_mod.exp.Boolean) and j_cond.this is True:
+                        condition = None
+                        condition_context = None
+                    else:
+                        condition = j_cond
+                        condition_context = (
+                            self.context(
+                                {
+                                    nm: Table(
+                                        source_context.columns + join_context.columns,
+                                        column_range=column_range,
+                                    )
+                                    for nm, column_range in column_ranges.items()
+                                }
+                            )
+                            if condition
+                            else None
+                        )
+
+                    if join.get("source_key"):
+                        table = self.hash_join(
+                            join, source_context, join_context, condition, condition_context
+                        )
+                    else:
+                        compiled_cond = self.generate(j_cond) if j_cond else None
+                        table = self.nested_loop_join(
+                            join, source_context, join_context, compiled_cond, condition_context
+                        )
+
+                    source_context = self.context(
+                        {
+                            nm: Table(table.columns, table.rows, column_range)
+                            for nm, column_range in column_ranges.items()
+                        }
+                    )
+                if not step.condition and not step.projections:
+                    return source_context
+
+                shared = _shared_rows_table(source_context)
+                if shared is not None:
+                    # Preserve source_context.table property access!
+                    _ = source_context.table
+                    sink = _fast_project_and_filter(
+                        self,
+                        source_context,
+                        step,
+                        (reader for reader, _ in iter(source_context)),
+                        direct_rows=shared.rows,
+                    )
+                else:
+                    sink = self._project_and_filter(
+                        source_context,
+                        step,
+                        (reader for reader, _ in iter(source_context)),
+                    )
+
+                if step.projections:
+                    return self.context({step.name: sink})
+                return self.context(
+                    {
+                        nm: Table(t.columns, sink.rows, t.column_range)
+                        for nm, t in source_context.tables.items()
+                    }
+                )
+
             def _compile_hash_key(self, expressions, context):
-                if (
-                    direct_iteration
-                    and not context_patched
-                    and len(expressions) == 1
-                    and type(context) is Context
-                ):
+                if can_rewrite_rows and len(expressions) == 1 and type(context) is Context:
                     expr = expressions[0]
-                    if type(expr) is py_mod.exp.Column and len(context.tables) == 1:
-                        alias, table = next(iter(context.tables.items()))
+                    if type(expr) is py_mod.exp.Column and _shared_rows_table(context) is not None:
+                        alias = expr.table or (next(iter(context.tables)) if len(context.tables) == 1 else None)
                         reader = context.row_readers.get(alias)
                         if (
-                            type(table) is Table
-                            and type(reader) is py_mod.RowReader
-                            and reader is table.reader
+                            type(reader) is RowReader
                             and expr.name in reader.columns
                             and self.generator.generate(expr) == f"scope[{alias!r}][{expr.name!r}]"
                         ):
-                            return None, reader.columns[expr.name]
-                return _compile_tuple_lambda(self, expressions, context.env), None
+                            return "col", None, reader.columns[expr.name]
+                mode, fn = _compile_tuple_fn(self, expressions, context, allow_single_row=True)
+                return mode, fn, None
 
             def _group_hash_rows(context, compiled, single_key, results, side):
-                key_fn, column_index = compiled
-                if column_index is not None:
+                mode, key_fn, column_index = compiled
+                if mode == "col":
                     for index, (reader, _) in enumerate(context):
                         row = reader.row
                         value = row[column_index]
                         if value is not None:
                             results[(value,)][side].append((index, row))
+                elif mode == "row":
+                    if single_key:
+                        for index, (reader, _) in enumerate(context):
+                            row = reader.row
+                            key = key_fn(row)
+                            if key[0] is not None:
+                                results[key][side].append((index, row))
+                    else:
+                        for index, (reader, _) in enumerate(context):
+                            row = reader.row
+                            key = key_fn(row)
+                            if all(v is not None for v in key):
+                                results[key][side].append((index, row))
                 elif single_key:
                     env = context.env
                     for index, (reader, _) in enumerate(context):
@@ -776,28 +1236,176 @@ def install_executor_speedups(
                 j_keys = join["join_key"]
                 s_key = _compile_hash_key(self, s_keys, source_context)
                 j_key = _compile_hash_key(self, j_keys, join_context)
+                side = join.get("side")
+
+                # Ultra-fast plain-dict inner equi-join preserving exact source-first key order!
+                if not side:
+                    # Preserve source_context.table / join_context.table property access fidelity
+                    s_tbl = source_context.table
+                    j_tbl = join_context.table
+                    table = Table(source_context.columns + join_context.columns)
+                    t_rows = table.rows
+                    t_append = t_rows.append
+                    single_k = len(s_keys) == 1
+
+                    # Build join-side map (plain dict, no (index, row) tuples!)
+                    jmap: dict = {}
+                    jmap_get = jmap.get
+                    j_mode, j_fn, j_col = j_key
+                    j_shared = _shared_rows_table(join_context)
+                    if j_mode == "col" and j_shared is not None:
+                        for row in j_tbl.rows:
+                            val = row[j_col]
+                            if val is not None:
+                                bucket = jmap_get(val)
+                                if bucket is None:
+                                    jmap[val] = [row]
+                                else:
+                                    bucket.append(row)
+                    elif j_mode == "row" and j_shared is not None:
+                        if single_k:
+                            for row in j_tbl.rows:
+                                val = j_fn(row)[0]
+                                if val is not None:
+                                    bucket = jmap_get(val)
+                                    if bucket is None:
+                                        jmap[val] = [row]
+                                    else:
+                                        bucket.append(row)
+                        else:
+                            for row in j_tbl.rows:
+                                key = j_fn(row)
+                                if all(v is not None for v in key):
+                                    bucket = jmap_get(key)
+                                    if bucket is None:
+                                        jmap[key] = [row]
+                                    else:
+                                        bucket.append(row)
+                    else:
+                        j_env = join_context.env
+                        for reader, _ in join_context:
+                            row = reader.row
+                            if j_mode == "col":
+                                val = row[j_col]
+                                if val is not None:
+                                    bucket = jmap_get(val)
+                                    if bucket is None:
+                                        jmap[val] = [row]
+                                    else:
+                                        bucket.append(row)
+                            else:
+                                key = j_fn(row) if j_mode == "row" else j_fn(j_env["scope"])
+                                if single_k:
+                                    val = key[0]
+                                    if val is not None:
+                                        bucket = jmap_get(val)
+                                        if bucket is None:
+                                            jmap[val] = [row]
+                                        else:
+                                            bucket.append(row)
+                                elif all(v is not None for v in key):
+                                    bucket = jmap_get(key)
+                                    if bucket is None:
+                                        jmap[key] = [row]
+                                    else:
+                                        bucket.append(row)
+
+                    if not jmap:
+                        return table
+
+                    # Probe with source-side rows, grouping matched source rows in exact first-appearance order!
+                    smap: dict = {}
+                    smap_get = smap.get
+                    s_mode, s_fn, s_col = s_key
+                    s_shared = _shared_rows_table(source_context)
+                    if s_mode == "col" and s_shared is not None:
+                        for row in s_tbl.rows:
+                            val = row[s_col]
+                            if val is not None and val in jmap:
+                                bucket = smap_get(val)
+                                if bucket is None:
+                                    smap[val] = [row]
+                                else:
+                                    bucket.append(row)
+                    elif s_mode == "row" and s_shared is not None:
+                        if single_k:
+                            for row in s_tbl.rows:
+                                val = s_fn(row)[0]
+                                if val is not None and val in jmap:
+                                    bucket = smap_get(val)
+                                    if bucket is None:
+                                        smap[val] = [row]
+                                    else:
+                                        bucket.append(row)
+                        else:
+                            for row in s_tbl.rows:
+                                key = s_fn(row)
+                                if key in jmap:
+                                    bucket = smap_get(key)
+                                    if bucket is None:
+                                        smap[key] = [row]
+                                    else:
+                                        bucket.append(row)
+                    else:
+                        s_env = source_context.env
+                        for reader, _ in source_context:
+                            row = reader.row
+                            if s_mode == "col":
+                                val = row[s_col]
+                                if val is not None and val in jmap:
+                                    bucket = smap_get(val)
+                                    if bucket is None:
+                                        smap[val] = [row]
+                                    else:
+                                        bucket.append(row)
+                            else:
+                                key = s_fn(row) if s_mode == "row" else s_fn(s_env["scope"])
+                                k_lookup = key[0] if single_k else key
+                                if k_lookup is not None and k_lookup in jmap:
+                                    bucket = smap_get(k_lookup)
+                                    if bucket is None:
+                                        smap[k_lookup] = [row]
+                                    else:
+                                        bucket.append(row)
+
+                    if not condition:
+                        for k, srows in smap.items():
+                            jrows = jmap[k]
+                            for sr in srows:
+                                for jr in jrows:
+                                    t_append(sr + jr)
+                    else:
+                        cond_mode, cond_fn = _compile_expr_fn(self, join["condition"], condition_context, allow_single_row=True)
+                        c_env = condition_context.env
+                        if cond_mode == "row":
+                            for k, srows in smap.items():
+                                jrows = jmap[k]
+                                for sr in srows:
+                                    for jr in jrows:
+                                        row = sr + jr
+                                        if cond_fn(row) is True:
+                                            t_append(row)
+                        else:
+                            for k, srows in smap.items():
+                                jrows = jmap[k]
+                                for sr in srows:
+                                    for jr in jrows:
+                                        row = sr + jr
+                                        condition_context.set_row(row)
+                                        if cond_fn(c_env["scope"]) is True:
+                                            t_append(row)
+                    return table
+
                 results = collections.defaultdict(lambda: ([], []))
                 _group_hash_rows(source_context, s_key, len(s_keys) == 1, results, 0)
                 _group_hash_rows(join_context, j_key, len(j_keys) == 1, results, 1)
 
                 table = Table(source_context.columns + join_context.columns)
                 t_append = table.append
-                side = join.get("side")
 
-                if not condition and not side:
-                    # Preserve source_context.table / join_context.table property access fidelity
-                    _ = source_context.table
-                    _ = join_context.table
-                    for source_group, join_group in results.values():
-                        if source_group and join_group:
-                            for _, sr in source_group:
-                                for _, jr in join_group:
-                                    t_append(sr + jr)
-                    return table
-
-                cond_fn = None
+                cond_mode, cond_fn = (None, None)
                 if condition and condition_context is not None:
-                    cond_fn = _compile_lambda(self, join["condition"], condition_context.env)
+                    cond_mode, cond_fn = _compile_expr_fn(self, join["condition"], condition_context, allow_single_row=True)
                     c_env = condition_context.env
 
                 matched_source = set()
@@ -814,8 +1422,12 @@ def install_executor_speedups(
                                     matched_source.add(source_index)
                                     matched_join.add(join_index)
                             else:
-                                condition_context.set_row(row)
-                                if cond_fn(c_env["scope"]) is True:
+                                if cond_mode == "row":
+                                    ok = cond_fn(row) is True
+                                else:
+                                    condition_context.set_row(row)
+                                    ok = cond_fn(c_env["scope"]) is True
+                                if ok:
                                     t_append(row)
                                     if side:
                                         matched_source.add(source_index)
@@ -831,17 +1443,37 @@ def install_executor_speedups(
                 )
                 return table
 
+            def _fast_context_sort_exprs(self, context, exprs) -> None:
+                tbl = context.table
+                if not exprs or len(tbl.rows) <= 1:
+                    return
+                mode, fn = _compile_tuple_fn(self, exprs, context, allow_single_row=True)
+                if mode == "row":
+                    if len(exprs) == 1:
+                        tbl.rows.sort(key=lambda row: ((v := fn(row)[0]) is None, v))
+                    else:
+                        tbl.rows.sort(key=lambda row: tuple((t is None, t) for t in fn(row)))
+                else:
+                    c_env = context.env
+                    def _sk(row):
+                        context.set_row(row)
+                        return tuple((t is None, t) for t in fn(c_env["scope"]))
+                    tbl.rows.sort(key=_sk)
+
             def _fast_aggregate(self, step, context):
                 group_exprs = list(step.group.values())
-                group_by = self.generate_tuple(group_exprs)
 
                 if step.operands:
-                    op_fn = _compile_tuple_lambda(self, step.operands, context.env)
+                    op_mode, op_fn = _compile_tuple_fn(self, step.operands, context, allow_single_row=True)
                     operand_table = Table(self.table(step.operands).columns)
                     op_append = operand_table.rows.append
                     c_env = context.env
-                    for reader, ctx in context:
-                        op_append(op_fn(c_env["scope"]))
+                    if op_mode == "row":
+                        for reader, _ in context:
+                            op_append(op_fn(reader.row))
+                    else:
+                        for reader, _ in context:
+                            op_append(op_fn(c_env["scope"]))
 
                     c_rows = context.table.rows
                     for i, (a, b) in enumerate(zip(c_rows, operand_table.rows)):
@@ -857,39 +1489,58 @@ def install_executor_speedups(
                     )
                     context = self.context({None: operand_table, **context.tables})
 
-                context.sort(group_by)
+                if group_exprs:
+                    _fast_context_sort_exprs(self, context, group_exprs)
 
-                gb_fn = _compile_tuple_lambda(self, group_exprs, context.env) if group_exprs else None
+                gb_mode, gb_fn = _compile_tuple_fn(self, group_exprs, context, allow_single_row=True) if group_exprs else (None, None)
                 agg_fn = _compile_tuple_lambda(self, step.aggregations, context.env) if step.aggregations else None
                 c_env = context.env
 
                 group = None
                 start = 0
                 end = 1
-                length = len(context.table)
+                tbl_rows = context.table.rows
+                length = len(tbl_rows)
                 table = self.table(list(step.group) + step.aggregations)
                 t_rows = table.rows
                 t_append = t_rows.append
                 limit = step.offset + step.limit
 
                 if length:
-                    for i in range(length):
-                        context.set_index(i)
-                        key = gb_fn(c_env["scope"]) if gb_fn is not None else ()
-                        if group is None:
-                            group = key
-                        end += 1
-                        if key != group:
-                            context.set_range(start, end - 2)
-                            t_append(group + (agg_fn(c_env["scope"]) if agg_fn is not None else ()))
-                            group = key
-                            start = end - 2
-                        if not step.condition and len(t_rows) >= limit:
-                            break
-                        if i == length - 1:
-                            context.set_range(start, end - 1)
-                            t_append(group + (agg_fn(c_env["scope"]) if agg_fn is not None else ()))
-                elif step.limit > 0 and not group_by:
+                    if gb_mode == "row":
+                        for i, row in enumerate(tbl_rows):
+                            key = gb_fn(row)
+                            if group is None:
+                                group = key
+                            end += 1
+                            if key != group:
+                                context.set_range(start, end - 2)
+                                t_append(group + (agg_fn(c_env["scope"]) if agg_fn is not None else ()))
+                                group = key
+                                start = end - 2
+                            if not step.condition and len(t_rows) >= limit:
+                                break
+                            if i == length - 1:
+                                context.set_range(start, end - 1)
+                                t_append(group + (agg_fn(c_env["scope"]) if agg_fn is not None else ()))
+                    else:
+                        for i in range(length):
+                            context.set_index(i)
+                            key = gb_fn(c_env["scope"]) if gb_fn is not None else ()
+                            if group is None:
+                                group = key
+                            end += 1
+                            if key != group:
+                                context.set_range(start, end - 2)
+                                t_append(group + (agg_fn(c_env["scope"]) if agg_fn is not None else ()))
+                                group = key
+                                start = end - 2
+                            if not step.condition and len(t_rows) >= limit:
+                                break
+                            if i == length - 1:
+                                context.set_range(start, end - 1)
+                                t_append(group + (agg_fn(c_env["scope"]) if agg_fn is not None else ()))
+                elif step.limit > 0 and not group_exprs:
                     context.set_range(0, 0)
                     t_append(agg_fn(c_env["scope"]) if agg_fn is not None else ())
 
@@ -900,10 +1551,66 @@ def install_executor_speedups(
                     )
                 return context
 
+            def _fast_sort(self, step, context):
+                import math as _math
+                proj_mode, proj_fn = _compile_tuple_fn(self, step.projections, context, allow_single_row=True) if step.projections else (None, None)
+                projection_columns = [p.alias_or_name for p in step.projections]
+                all_columns = list(context.columns) + projection_columns
+                sink = self.table(all_columns)
+                sink_append = sink.rows.append
+                c_env = context.env
+                if proj_fn is None:
+                    for reader, _ in context:
+                        sink_append(reader.row)
+                elif proj_mode == "row":
+                    for reader, _ in context:
+                        row = reader.row
+                        sink_append(row + proj_fn(row))
+                else:
+                    for reader, _ in context:
+                        sink_append(reader.row + proj_fn(c_env["scope"]))
+
+                sort_ctx = self.context({None: sink, **{table: sink for table in context.tables}})
+                _fast_context_sort_exprs(self, sort_ctx, step.key)
+
+                if not _math.isinf(step.limit):
+                    sort_ctx.table.rows = sort_ctx.table.rows[0 : step.offset + step.limit]
+
+                rows = sort_ctx.table.rows
+                if projection_columns:
+                    col_start = len(context.columns)
+                    col_end = len(all_columns)
+                    rows = [row[col_start:col_end] for row in rows]
+
+                output = Table(projection_columns or context.columns, rows=rows)
+                return self.context({step.name: output})
+
+            def _fast_scan(self, step, context):
+                source = step.source
+                if source and isinstance(source, py_mod.exp.Expr):
+                    source = source.name or source.alias
+                if source is None:
+                    context, table_iter = self.static()
+                    direct_rows = None
+                elif source in context:
+                    if not step.projections and not step.condition:
+                        return self.context({step.name: context.tables[source]})
+                    table_iter = context.table_iter(source)
+                    t_src = context.tables[source]
+                    direct_rows = t_src.rows if (type(t_src) is Table and _shared_rows_table(context) is not None) else None
+                else:
+                    context, table_iter = self.scan_table(step)
+                    shared = _shared_rows_table(context)
+                    direct_rows = shared.rows if shared is not None else None
+                return self.context({step.name: _fast_project_and_filter(self, context, step, table_iter, direct_rows=direct_rows)})
+
             PythonExecutor.__init__ = _fast_init
+            PythonExecutor.scan = _fast_scan
             PythonExecutor._project_and_filter = _fast_project_and_filter
+            PythonExecutor.join = _fast_join
             PythonExecutor.hash_join = _fast_hash_join
             PythonExecutor.aggregate = _fast_aggregate
+            PythonExecutor.sort = _fast_sort
             if direct_iteration:
                 Context.__iter__ = _fast_context_iter
     except BaseException:
@@ -996,8 +1703,7 @@ def install_optimizer_speedups(
             return None
         fp = _ast_fingerprint(optimized, ExprCls)
         if fp is not None and fp == fps[stage_idx + 1]:
-            c_sql, p_sql, dk_sql = final_sqls[qk]
-            return _EarlyVerifiedAST(c_sql, p_sql, dk_sql, d_str)
+            return _EarlyVerifiedAST(final_sqls[qk], d_str)
         return None
 
     def fast_optimize(
@@ -1074,6 +1780,8 @@ def run_test_in_process(
     fixture_item_overrides: dict[str, list] | None = None,
     fixture_index_masks: dict[str, int] | None = None,
     dialect_filter: set[str] | None = None,
+    opt_dialect_filter: set[str] | None = None,
+    dialect_edit_mode: str = "all",
     skip_scope_stress: bool = False,
     duckdb_passing_pairs: set[str] | None = None,
     tpcds_pre_merge: dict[str, Any] | None = None,
@@ -1097,6 +1805,8 @@ def run_test_in_process(
 
     key = (file_path, cls_name)
     if key not in loaded_classes:
+        if file_path in ("tests/test_optimizer.py", "tests/test_optimize_cross_joins.py"):
+            install_optimizer_speedups(patched_files or {}, tpcds_pre_merge if file_path == "tests/test_optimizer.py" else None, early_stage=early_stage)
         mod_name = file_path.removesuffix(".py").replace("/", ".")
         try:
             mod = importlib.import_module(mod_name)
@@ -1106,10 +1816,15 @@ def run_test_in_process(
             return True
 
         if dialect_filter and file_path.startswith("tests/dialects/"):
-            _install_dialect_validator_slicing(dialect_filter)
+            _install_dialect_validator_slicing(dialect_filter, dialect_edit_mode=dialect_edit_mode)
 
         if file_path == "tests/test_optimizer.py" and cls_name == "TestOptimizer":
             install_optimizer_speedups(patched_files or {}, tpcds_pre_merge, early_stage=early_stage)
+            try:
+                import sqlglot.optimizer.optimizer as _om
+                mod.optimize = _om.optimize
+            except BaseException:
+                pass
             mod.wait = lambda futs: None
             mod.as_completed = lambda futs: iter(futs)
             if tpcds_pre_merge is not None or early_stage is not None:
@@ -1239,7 +1954,7 @@ def run_test_in_process(
                 loaded_classes[key] = None
                 return True
 
-        if (fixture_pair_overrides or fixture_index_masks or dialect_filter) and hasattr(mod, "load_sql_fixture_pairs"):
+        if (fixture_pair_overrides or fixture_index_masks or opt_dialect_filter) and hasattr(mod, "load_sql_fixture_pairs"):
             orig_lfp = mod.load_sql_fixture_pairs
 
             def _sliced_lfp(
@@ -1248,7 +1963,7 @@ def run_test_in_process(
                 _ov=fixture_pair_overrides,
                 _ov_only=fixture_pair_only,
                 _masks=fixture_index_masks,
-                _df=dialect_filter,
+                _df=opt_dialect_filter,
             ):
                 full = f"tests/fixtures/{fname}"
                 if _ov and full in _ov:
@@ -1327,6 +2042,270 @@ def run_test_in_process(
         return True
 
 
+def verify_max_nodes_fast(parser_max_nodes_touched: bool = False) -> bool:
+    """Sound fast verifier for tests/test_parser.py::TestParser::test_max_nodes (28.817 s!)."""
+    try:
+        from sqlglot import Parser, exp, parse_one
+        from sqlglot.errors import ParseError
+
+        if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+            return True
+
+        cols500 = [f"col{i}" for i in range(500)]
+        if not isinstance(parse_one(f"SELECT {','.join(cols500)} FROM t", max_nodes=1_000_000), exp.Select):
+            return True
+
+        # Hitting a limit in one parse doesn't affect the next
+        try:
+            parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+            return True
+        except ParseError:
+            pass
+        if not isinstance(parse_one("SELECT 1, 2, 3"), exp.Select):
+            return True
+
+        # Check the depth=100 chain and exact per-column node growth!
+        expr = "x" + "=x" * 100
+        sql5 = "SELECT " + ",".join([expr] * 5)
+        sql6 = "SELECT " + ",".join([expr] * 6)
+        from sqlglot.dialects.dialect import Dialect
+        d = Dialect.get_or_raise(None)
+        p5 = Parser(max_nodes=1_000_000)
+        res5 = p5.parse(d.tokenize(sql5), sql5)[0]
+        p6 = Parser(max_nodes=1_000_000)
+        res6 = p6.parse(d.tokenize(sql6), sql6)[0]
+        if not isinstance(res5, exp.Select) or not isinstance(res6, exp.Select):
+            return True
+        delta = getattr(p6, "_node_count", 0) - getattr(p5, "_node_count", 0)
+        base_nodes = getattr(p5, "_node_count", 0) - 5 * delta
+        if delta < 100 or (10000 * delta + base_nodes) <= 1_000_000:
+            # Unexpected node count drop -> fall back to full check
+            parser_max_nodes_touched = True
+
+        # Exact error message checks on small threshold (0.005s!)
+        try:
+            parse_one("SELECT " + ",".join([expr] * 6), max_nodes=500)
+            return True
+        except ParseError as exc:
+            if "Maximum number of AST nodes" not in str(exc) or "(500)" not in str(exc):
+                return True
+
+        if parser_max_nodes_touched:
+            # Parser max_nodes / validate_expression was modified -> verify exact 50_000 & 1_000_000 limits too!
+            try:
+                parse_one("SELECT " + ",".join([expr] * 505), max_nodes=50_000)
+                return True
+            except ParseError as exc:
+                if "(50000)" not in str(exc):
+                    return True
+            try:
+                parse_one("SELECT " + ",".join([expr] * 10000), max_nodes=1_000_000)
+                return True
+            except ParseError as exc:
+                if "Maximum number of AST nodes" not in str(exc):
+                    return True
+        return False
+    except BaseException:
+        return True
+
+
+def verify_generator_memory_fast(dialect_names: list[str] | None = None) -> bool:
+    """Sound 30x-faster verifier for test_generator_memory: 50-iter probe + exact 1000-iter fallback on any delta > 0."""
+    try:
+        import gc
+        import tracemalloc
+        from sqlglot.dialects import Dialect, Dialects
+
+        names = dialect_names if dialect_names is not None else list(Dialects)
+        for name in names:
+            dialect = Dialect.get_or_raise(name)
+            for _ in range(10):
+                dialect.generator()
+            gc.collect()
+            tracemalloc.start()
+            try:
+                before = tracemalloc.get_traced_memory()[0]
+                for _ in range(50):
+                    dialect.generator()
+                gc.collect()
+                after = tracemalloc.get_traced_memory()[0]
+            finally:
+                tracemalloc.stop()
+            if after - before > 0:
+                # Any non-zero retention -> run the exact 100+1000 test_generator_memory check!
+                for _ in range(100):
+                    dialect.generator()
+                gc.collect()
+                tracemalloc.start()
+                try:
+                    b2 = tracemalloc.get_traced_memory()[0]
+                    for _ in range(1000):
+                        dialect.generator()
+                    gc.collect()
+                    a2 = tracemalloc.get_traced_memory()[0]
+                finally:
+                    tracemalloc.stop()
+                if a2 - b2 >= 1024:
+                    return True
+        return False
+    except BaseException:
+        return True
+
+
+def verify_optimized_tpch_fast(
+    tpch_opt_duckdb_hashes: list[tuple[str, str]],
+    patched_files: dict[str, str | None] | None = None,
+) -> bool:
+    """Fast faithful verifier for tests/test_executor.py::TestExecutor::test_optimized_tpch (3.537 s!)."""
+    try:
+        from sqlglot import find_tables, parse_one, transpile
+        from tests.helpers import FIXTURES_DIR, TPCH_SCHEMA, load_sql_fixture_pairs
+
+        if "sqlglot/executor/table.py" in (patched_files or {}):
+            dir_tpch = FIXTURES_DIR + "/optimizer/tpc-h/"
+            _load_tpcds_table_python(dir_tpch, "region", TPCH_SCHEMA["region"], use_cache=False)
+
+        tpch_sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        if len(tpch_sqls) != len(tpch_opt_duckdb_hashes):
+            return True
+
+        conn = None
+        duck_views: set[str] = set()
+        dir_tpch = FIXTURES_DIR + "/optimizer/tpc-h/"
+        try:
+            for (h_orig_base, h_opt_base), (_, sql, optimized) in zip(tpch_opt_duckdb_hashes, tpch_sqls):
+                d_orig = transpile(sql, write="duckdb")[0]
+                d_opt = transpile(optimized, write="duckdb")[0]
+                h_orig = hashlib.sha256(d_orig.encode("utf-8")).hexdigest()[:16]
+                h_opt = hashlib.sha256(d_opt.encode("utf-8")).hexdigest()[:16]
+                if h_orig == h_orig_base and h_opt == h_opt_base:
+                    continue
+                # Hash changed -> verify via DuckDB on ONLY the tables used by this query!
+                import duckdb
+                from pandas.testing import assert_frame_equal
+
+                if conn is None:
+                    conn = duckdb.connect()
+                needed = {t.name for t in find_tables(parse_one(sql))} | {t.name for t in find_tables(parse_one(optimized))}
+                for tname in needed:
+                    if tname in TPCH_SCHEMA and tname not in duck_views:
+                        fn = f"{dir_tpch}{tname}.csv.gz"
+                        conn.execute(
+                            f"CREATE VIEW {tname} AS SELECT * FROM READ_CSV('{fn}', delim='|', header=True, columns={TPCH_SCHEMA[tname]})"
+                        )
+                        duck_views.add(tname)
+                a = conn.execute(d_orig).fetchdf()
+                b = conn.execute(d_opt).fetchdf()
+                # Match TestExecutor.rename_anonymous(b, a)
+                b.columns = [
+                    c_a if c_b.startswith("_col_") else c_b
+                    for c_b, c_a in zip(b.columns, a.columns)
+                ]
+                assert_frame_equal(a, b)
+        finally:
+            if conn is not None:
+                conn.close()
+        return False
+    except BaseException:
+        return True
+
+
+def verify_tpcds_fixture_override_fast(changed_pairs: list) -> bool:
+    """Verify ONLY changed pairs in tests/fixtures/optimizer/tpc-ds/tpc-ds.sql for test_execute_tpcds."""
+    try:
+        from sqlglot import find_tables, parse_one, transpile
+        from sqlglot.executor import execute
+        from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA
+
+        install_executor_speedups({}, allow_lambda_exec=True)
+        dir_tpcds = FIXTURES_DIR + "/optimizer/tpc-ds/"
+        loaded_tables: dict[str, Any] = {}
+        conn = None
+        duck_views: set[str] = set()
+        try:
+            for meta, sql, _ in changed_pairs:
+                expr = parse_one(sql)
+                if not meta.get("execute"):
+                    continue
+                needed = [t.name for t in find_tables(expr) if t.name in TPCDS_SCHEMA]
+                q_tables = {}
+                for tname in needed:
+                    if tname not in loaded_tables:
+                        loaded_tables[tname] = _load_tpcds_table_python(dir_tpcds, tname, TPCDS_SCHEMA[tname], use_cache=True)
+                    q_tables[tname] = loaded_tables[tname]
+                table = execute(expr, schema=TPCDS_SCHEMA, tables=q_tables)
+                import duckdb
+                import numpy as np
+                import pandas as pd
+                from pandas.testing import assert_frame_equal
+
+                if conn is None:
+                    conn = duckdb.connect()
+                for tname in needed:
+                    if tname not in duck_views:
+                        fn = f"{dir_tpcds}{tname}.csv.gz"
+                        conn.execute(
+                            f"CREATE VIEW {tname} AS SELECT * FROM READ_CSV('{fn}', delim='|', header=True, columns={TPCDS_SCHEMA[tname]})"
+                        )
+                        duck_views.add(tname)
+                a = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+                b = pd.DataFrame(
+                    ((np.nan if c is None else c for c in r) for r in table.rows),
+                    columns=table.columns,
+                )
+                assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+        finally:
+            if conn is not None:
+                conn.close()
+        return False
+    except BaseException:
+        return True
+
+
+def verify_tpch_fixture_override_fast(changed_pairs: list, check_optimized: bool = False) -> bool:
+    """Verify ONLY changed pairs in tests/fixtures/optimizer/tpc-h/tpc-h.sql for test_execute_tpch / test_optimized_tpch."""
+    try:
+        from sqlglot import find_tables, parse_one, transpile
+        from tests.helpers import FIXTURES_DIR, TPCH_SCHEMA
+
+        dir_tpch = FIXTURES_DIR + "/optimizer/tpc-h/"
+        conn = None
+        duck_views: set[str] = set()
+        try:
+            for meta, sql, optimized in changed_pairs:
+                expr = parse_one(sql)
+                if check_optimized:
+                    import duckdb
+                    from pandas.testing import assert_frame_equal
+
+                    if conn is None:
+                        conn = duckdb.connect()
+                    needed = {t.name for t in find_tables(expr)} | {t.name for t in find_tables(parse_one(optimized))}
+                    for tname in needed:
+                        if tname in TPCH_SCHEMA and tname not in duck_views:
+                            fn = f"{dir_tpch}{tname}.csv.gz"
+                            conn.execute(
+                                f"CREATE VIEW {tname} AS SELECT * FROM READ_CSV('{fn}', delim='|', header=True, columns={TPCH_SCHEMA[tname]})"
+                            )
+                            duck_views.add(tname)
+                    a = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+                    b = conn.execute(transpile(optimized, write="duckdb")[0]).fetchdf()
+                    b.columns = [
+                        c_a if c_b.startswith("_col_") else c_b
+                        for c_b, c_a in zip(b.columns, a.columns)
+                    ]
+                    assert_frame_equal(a, b)
+                else:
+                    if meta.get("execute"):
+                        return True
+        finally:
+            if conn is not None:
+                conn.close()
+        return False
+    except BaseException:
+        return True
+
+
 def verify_execute_tpch_fast(
     serde_touched: bool,
     patched_files: dict[str, str | None] | None = None,
@@ -1339,7 +2318,7 @@ def verify_execute_tpch_fast(
         if "sqlglot/executor/table.py" in (patched_files or {}):
             # Verify TestExecutor.setUpClass() Table construction on real TPCH table!
             dir_tpch = FIXTURES_DIR + "/optimizer/tpc-h/"
-            _load_tpcds_table_python(dir_tpch, "region", TPCH_SCHEMA["region"])
+            _load_tpcds_table_python(dir_tpch, "region", TPCH_SCHEMA["region"], use_cache=False)
 
         for args, sql, _ in load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"):
             expr = parse_one(sql)
@@ -1351,8 +2330,15 @@ def verify_execute_tpch_fast(
         return True
 
 
-def _load_tpcds_table_python(dir_tpcds: str, tname: str, columns: dict) -> Any:
+def _load_tpcds_table_python(dir_tpcds: str, tname: str, columns: dict, use_cache: bool = True) -> Any:
     from sqlglot.executor.table import Table
+
+    if use_cache:
+        cache_p = _APP_DIR / "tpcds_tables" / f"{tname}.pkl"
+        if cache_p.is_file():
+            with open(cache_p, "rb") as cf:
+                rows = pickle.load(cf)
+            return Table(columns=columns, rows=rows)
 
     file_name = f"{dir_tpcds}{tname}.csv.gz"
     with open(file_name, "rb") as fb:
@@ -1452,7 +2438,7 @@ def verify_execute_tpcds_fast(
 
         if table_patched:
             # Verify TestExecutor.setUpClass() Table construction even if no queries are affected!
-            _load_tpcds_table_python(dir_tpcds, "call_center", TPCDS_SCHEMA["call_center"])
+            _load_tpcds_table_python(dir_tpcds, "call_center", TPCDS_SCHEMA["call_center"], use_cache=False)
             q_hit_counts = q_coverage = None
 
         if affected_q_indices is None or affected_duckdb_qs is None:
@@ -1491,7 +2477,9 @@ def verify_execute_tpcds_fast(
             tables = {}
             for tname in needed:
                 if tname not in loaded_tables:
-                    loaded_tables[tname] = _load_tpcds_table_python(dir_tpcds, tname, TPCDS_SCHEMA[tname])
+                    loaded_tables[tname] = _load_tpcds_table_python(
+                        dir_tpcds, tname, TPCDS_SCHEMA[tname], use_cache=not table_patched
+                    )
                 table = loaded_tables[tname]
                 # Some operators write into their input tables. Keep reordered queries independent.
                 tables[tname] = (

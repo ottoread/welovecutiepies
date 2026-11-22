@@ -309,22 +309,43 @@ def analyze_python_edit(
     # Index functions & classes in both orig_ast and new_ast
     orig_funcs: dict[str, ast.AST] = {}
     new_funcs: dict[str, ast.AST] = {}
-    orig_classes: set[str] = set()
+    orig_classes: dict[str, ast.ClassDef] = {}
+    new_classes: dict[str, ast.ClassDef] = {}
 
-    def index_ast(node: ast.AST, funcs_out: dict[str, ast.AST], classes_out: set[str] | None, prefix: str = "") -> None:
+    def index_ast(
+        node: ast.AST,
+        funcs_out: dict[str, ast.AST],
+        classes_out: dict[str, ast.ClassDef] | None,
+        prefix: str = "",
+    ) -> None:
         for child in getattr(node, "body", []):
             if isinstance(child, ast.ClassDef):
                 qn = f"{prefix}.{child.name}" if prefix else child.name
                 if classes_out is not None:
-                    classes_out.add(qn)
+                    classes_out[qn] = child
                 index_ast(child, funcs_out, classes_out, qn)
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qn = f"{prefix}.{child.name}" if prefix else child.name
                 funcs_out[qn] = child
                 index_ast(child, funcs_out, classes_out, qn)
 
+    def _func_header_sig(fn: ast.AST) -> tuple:
+        return (
+            type(fn).__name__,
+            ast.dump(fn.args, include_attributes=False),
+            tuple(ast.dump(d, include_attributes=False) for d in fn.decorator_list),
+            ast.dump(fn.returns, include_attributes=False) if getattr(fn, "returns", None) is not None else None,
+        )
+
+    def _class_header_sig(cls: ast.ClassDef) -> tuple:
+        return (
+            tuple(ast.dump(b, include_attributes=False) for b in cls.bases),
+            tuple(ast.dump(kw, include_attributes=False) for kw in cls.keywords),
+            tuple(ast.dump(d, include_attributes=False) for d in cls.decorator_list),
+        )
+
     index_ast(orig_ast, orig_funcs, orig_classes)
-    index_ast(new_ast, new_funcs, None)
+    index_ast(new_ast, new_funcs, new_classes)
 
     unchanged_funcs: set[str] = set()
     for qn, ofn in orig_funcs.items():
@@ -361,9 +382,9 @@ def analyze_python_edit(
             if isinstance(stmt, ast.ClassDef):
                 cname = ".".join(class_stack + [stmt.name])
                 info.enclosing_classes.add(cname)
-                # Check if header/decorators/bases edited or direct class body stmt edited
-                body_start = stmt.body[0].lineno if stmt.body else e
-                if any(ln < body_start for ln in hit_lines):
+                # Exact AST header/decorator/base check (immune to pure-insertion adjacent-line spill!)
+                ncls = new_classes.get(cname)
+                if ncls is None or _class_header_sig(stmt) != _class_header_sig(ncls):
                     info.class_level_edits.add(cname)
                     info.class_non_attr_edits.add(cname)
                 # Recurse into class body
@@ -382,9 +403,9 @@ def analyze_python_edit(
                 first_ln = _first_exec_line(stmt)
                 if first_ln is not None:
                     info.func_entry_lines.add(first_ln)
-                # Check if decorator/signature/defaults edited -> class/module level!
-                body_start = stmt.body[0].lineno if stmt.body else e
-                if any(ln < body_start for ln in hit_lines):
+                # Exact AST decorator/signature/defaults check (immune to pure-insertion adjacent-line spill!)
+                nfn = new_funcs.get(qn)
+                if nfn is None or _func_header_sig(stmt) != _func_header_sig(nfn):
                     if class_stack and not func_stack:
                         cname = ".".join(class_stack)
                         info.class_level_edits.add(cname)
@@ -393,8 +414,8 @@ def analyze_python_edit(
                         info.module_level_edit = True
                         info.module_level_names.add(stmt.name)
                 # Check if lexical bindings changed
-                if qn in new_funcs:
-                    if _collect_local_bindings(stmt) != _collect_local_bindings(new_funcs[qn]):
+                if nfn is not None:
+                    if _collect_local_bindings(stmt) != _collect_local_bindings(nfn):
                         info.scope_changed_funcs.add(qn)
                 walk_scope(stmt.body, class_stack, func_stack + [(stmt.name, stmt)])
                 continue
@@ -489,8 +510,8 @@ def analyze_python_edit(
             if isinstance(stmt, ast.ClassDef):
                 cname = ".".join(class_stack + [stmt.name])
                 info.enclosing_classes.add(cname)
-                body_start = stmt.body[0].lineno if stmt.body else e
-                if cname not in orig_classes or any(ln < body_start for ln in hit_lines):
+                ocls = orig_classes.get(cname)
+                if ocls is None or _class_header_sig(ocls) != _class_header_sig(stmt):
                     info.class_level_edits.add(cname)
                     info.class_non_attr_edits.add(cname)
                     if not class_stack and not func_stack:
@@ -517,8 +538,7 @@ def analyze_python_edit(
                     first_ln = _first_exec_line(orig_funcs[qn])
                     if first_ln is not None:
                         info.func_entry_lines.add(first_ln)
-                    body_start = stmt.body[0].lineno if stmt.body else e
-                    if any(ln < body_start for ln in hit_lines):
+                    if _func_header_sig(orig_funcs[qn]) != _func_header_sig(stmt):
                         if class_stack and not func_stack:
                             cname = ".".join(class_stack)
                             info.class_level_edits.add(cname)
@@ -690,6 +710,23 @@ def _changed_class_member(original: str, patched: str) -> tuple[tuple[str, ...],
         owners.append(old.name)
         change = _single_changed_statement(old_body, new_body)
     return None
+
+
+def is_parser_max_nodes_edit(edit: PyEditInfo) -> bool:
+    """Return True if a sqlglot/parser.py edit could alter max_nodes / _node_count / raise_error logic."""
+    if edit.path != "sqlglot/parser.py":
+        return False
+    if edit.syntax_error or edit.is_added_or_deleted or edit.module_level_edit or edit.class_level_edits:
+        return True
+    sensitive = {
+        "Parser.__init__",
+        "Parser.reset",
+        "Parser.validate_expression",
+        "Parser.raise_error",
+        "Parser.parse",
+        "Parser._parse",
+    }
+    return bool(edit.enclosing_funcs & sensitive)
 
 
 def is_numeric_escape_value_edit(original: str, patched: str) -> bool:
