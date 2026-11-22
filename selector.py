@@ -31,7 +31,6 @@ from inmem_loader import (
 from patch_utils import (
     analyze_python_edit,
     apply_file_patch,
-    detect_single_invariant_op_edit,
     diff_sql_fixture_pairs,
     diff_sql_fixtures,
     has_only_shadowed_metadata_inserts,
@@ -93,12 +92,19 @@ DEFAULT_CORE_FILES = {
 }
 
 TEST_EXECUTE_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TEST_OPTIMIZER_TPCDS = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+TEST_OPTIMIZER_SCOPE = "tests/test_optimizer.py::TestOptimizer::test_scope"
 TEST_EXECUTE_TPCH = "tests/test_executor.py::TestExecutor::test_execute_tpch"
 TEST_OPTIMIZED_TPCH = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
 TEST_MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 TEST_GEN_MEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 TEST_TYPING = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
 TEST_LAZY_LOAD = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
+
+# CPU estimates relative to recorded test durations for the unsliced verifier.
+# The optimizer TPC-DS verifier runs the upstream process pool serially.
+OPTIMIZER_TPCDS_CPU_RATIO = 3.15
+OPTIMIZER_SCOPE_CPU_RATIO = 1.28
 
 SINGLE_LINE_SQL_FIXTURES = {
     "tests/fixtures/identity.sql",
@@ -259,9 +265,7 @@ def _execute_job_in_child(
     t_cpu0 = time.process_time()
 
     exec_items = [x for x in test_items if x[1] == TEST_EXECUTE_TPCDS]
-    opt_items = [
-        x for x in test_items if x[1] == "tests/test_optimizer.py::TestOptimizer::test_tpcds"
-    ]
+    opt_items = [x for x in test_items if x[1] == TEST_OPTIMIZER_TPCDS]
     tpcds_pre_merge: dict[str, Any] | None = None
     share_tpcds = (
         bool(opt_items and exec_items)
@@ -306,28 +310,104 @@ def _execute_job_in_child(
     if gen_mem_fast:
         fast_giant_tids.add(TEST_GEN_MEM)
     fast_giant_nums = {n for n, tid in test_items if tid in fast_giant_tids}
+    exec_num_set = {n for n, _ in exec_items}
+    probe_nums: set[int] = set(job.get("probe_nums", ()))
+    cal_state = job.get("cal_state")
+    if cal_state is not None:
+        cal_est_ms, cal_act_ms, cal_tiny_cnt, cal_tiny_ms = cal_state
+    else:
+        cal_est_ms, cal_act_ms, cal_tiny_cnt, cal_tiny_ms = 400.0, 400.0, 10, 15.0
 
     remaining = {n for n, _ in test_items}
-    remaining_cpu_ms = sum(verification_cpu_ms.get(n, 0.0) for n in remaining)
+    rem_giant_est = 0.0
+    rem_norm_est = 0.0
+    rem_norm_cnt = 0
+    rem_tiny_est = 0.0
+    rem_tiny_cnt = 0
+    for n in remaining:
+        est = verification_cpu_ms.get(n, 0.0)
+        if n in fast_giant_nums:
+            rem_giant_est += est
+        elif est >= 15.0:
+            rem_norm_est += est
+            rem_norm_cnt += 1
+        else:
+            rem_tiny_est += est
+            rem_tiny_cnt += 1
+
+    def _cal_params() -> tuple[float, float]:
+        sc = cal_act_ms / max(cal_est_ms, 1.0)
+        if sc < 0.25:
+            sc = 0.25
+        elif sc > 3.0:
+            sc = 3.0
+        ov = cal_tiny_ms / max(cal_tiny_cnt, 1)
+        if ov < 0.3:
+            ov = 0.3
+        elif ov > 12.0:
+            ov = 12.0
+        return sc, ov
+
+    def _cal_one(n: int) -> float:
+        est = verification_cpu_ms.get(n, 1.0)
+        sc, ov = _cal_params()
+        if n in fast_giant_nums:
+            gsc = 0.35 if sc < 0.35 else (2.5 if sc > 2.5 else sc)
+            return est * gsc
+        if est >= 15.0:
+            return est * sc + 0.5 * ov
+        return max(ov, est * sc)
+
+    def _cal_remaining() -> float:
+        sc, ov = _cal_params()
+        gsc = 0.35 if sc < 0.35 else (2.5 if sc > 2.5 else sc)
+        return (
+            rem_giant_est * gsc
+            + rem_norm_est * sc
+            + rem_norm_cnt * (0.5 * ov)
+            + max(rem_tiny_cnt * ov, rem_tiny_est * sc)
+        )
+
+    def _pop_remaining(n: int) -> None:
+        nonlocal rem_giant_est, rem_norm_est, rem_norm_cnt, rem_tiny_est, rem_tiny_cnt
+        remaining.remove(n)
+        est = verification_cpu_ms.get(n, 0.0)
+        if n in fast_giant_nums:
+            rem_giant_est -= est
+        elif est >= 15.0:
+            rem_norm_est -= est
+            rem_norm_cnt -= 1
+        else:
+            rem_tiny_est -= est
+            rem_tiny_cnt -= 1
+
     have_required = bool(auto_include or failing)
     next_pack_check = 0
     timeout_count = 0
     timings: list[tuple[str, float]] = []
     for idx, (tnum, tid) in enumerate(test_items):
         test_cpu_start = time.process_time()
-        if idx > 0 and (test_cpu_start - t_cpu0) > per_commit_cpu_cap:
+        eff_cap = max(per_commit_cpu_cap, 18.0) if (remaining & fast_giant_nums) else per_commit_cpu_cap
+        if idx > 0 and (test_cpu_start - t_cpu0) > eff_cap:
             failing.extend(remaining)
             break
+
+        t_cal_cpu = _cal_one(tnum) if verification_cpu_ms else 0.0
+        cal_rem_cpu = _cal_remaining() if verification_cpu_ms else 0.0
+        has_rem_giants = bool(remaining & fast_giant_nums)
 
         if (
             verification_cpu_ms
             and dur_ms_map
             and (
                 idx >= next_pack_check
-                or dur_ms_map.get(tnum, 0) >= 300
-                or verification_cpu_ms.get(tnum, 0.0) >= 120.0
+                or dur_ms_map.get(tnum, 0) >= 250
+                or t_cal_cpu >= 100.0
             )
-            and (have_required or (remaining_cpu_ms >= 3500.0 and not (remaining & fast_giant_nums)))
+            and (
+                have_required
+                or (tnum not in probe_nums and cal_rem_cpu >= 1500.0 and not has_rem_giants)
+            )
         ):
             required = auto_include.union(failing)
             req_cost = pack_cost_ms(required, dur_ms_map) if required else 0
@@ -337,22 +417,46 @@ def _execute_job_in_child(
                 # Every remaining candidate packs into existing worker slack for 0ms!
                 failing.extend(remaining)
                 break
-            if remaining & fast_giant_nums:
+            if has_rem_giants:
                 # Keep checking right after each fast-verified giant finishes!
                 next_pack_check = idx + 1
             else:
-                if savings_ms <= remaining_cpu_ms:
-                    # Only stop if even the next (highest-ROI / heaviest) remaining test isn't worth its CPU cost!
+                if savings_ms <= cal_rem_cpu:
+                    # Only stop if even the next remaining test isn't worth its calibrated CPU cost!
                     without_next = pack_cost_ms(required | (remaining - {tnum}), dur_ms_map)
                     t_marginal = all_cost - without_next
-                    if t_marginal <= verification_cpu_ms.get(tnum, 1.0):
+                    if t_marginal <= t_cal_cpu:
                         failing.extend(remaining)
                         break
-                next_pack_check = idx + (1 if dur_ms_map.get(tnum, 0) >= 500 else 12)
+                next_pack_check = idx + (1 if dur_ms_map.get(tnum, 0) >= 400 else 8)
 
-        remaining.remove(tnum)
-        remaining_cpu_ms -= verification_cpu_ms.get(tnum, 0.0)
+        # Individual provably negative-ROI test skip (never skips fast giants; skips shared test_tpcds if have_required already!)
+        is_shared_tpcds_prereq = (
+            tpcds_pre_merge is not None
+            and tid == TEST_OPTIMIZER_TPCDS
+            and bool(remaining & exec_num_set)
+            and not have_required
+        )
+        if (
+            verification_cpu_ms
+            and dur_ms_map
+            and tnum not in fast_giant_nums
+            and not is_shared_tpcds_prereq
+        ):
+            t_dur = dur_ms_map.get(tnum, 0)
+            if (
+                (have_required and t_cal_cpu >= 80.0 and t_cal_cpu > t_dur * 1.05)
+                or (not have_required and tnum not in probe_nums and t_cal_cpu >= 2500.0 and t_cal_cpu > (2000 + t_dur) * 1.05)
+            ):
+                _pop_remaining(tnum)
+                failing.append(tnum)
+                have_required = True
+                next_pack_check = idx + 1
+                continue
+
+        _pop_remaining(tnum)
         prior_failures = len(failing)
+        timed_out = False
 
         # Per-test infinite-loop protection via SIGALRM (timeout = test failure, matching pytest-timeout!)
         rec_s = dur_ms_map.get(tnum, 500) / 1000.0
@@ -451,18 +555,29 @@ def _execute_job_in_child(
             ):
                 failing.append(tnum)
         except _TestTimeout:
+            timed_out = True
             failing.append(tnum)
             timeout_count += 1
             if timeout_count >= 2:
                 per_commit_cpu_cap = min(per_commit_cpu_cap, 8.0)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
-            timings.append((tid, round(time.process_time() - test_cpu_start, 3)))
+            elapsed_s = time.process_time() - test_cpu_start
+            timings.append((tid, round(elapsed_s, 3)))
             if len(failing) > prior_failures:
                 have_required = True
                 next_pack_check = idx + 1
+            elif not timed_out and tnum not in fast_giant_nums and verification_cpu_ms:
+                est_ms = verification_cpu_ms.get(tnum, 0.0)
+                act_ms = elapsed_s * 1000.0
+                if est_ms >= 20.0:
+                    cal_est_ms += est_ms
+                    cal_act_ms += min(act_ms, max(80.0, est_ms * 5.0))
+                elif est_ms > 0.0:
+                    cal_tiny_cnt += 1
+                    cal_tiny_ms += min(act_ms, 15.0)
 
-    return ("ok", failing, time.process_time(), timings)
+    return ("ok", failing, time.process_time(), timings, (cal_est_ms, cal_act_ms, cal_tiny_cnt, cal_tiny_ms))
 
 
 class ForkRunner:
@@ -476,6 +591,7 @@ class ForkRunner:
         self._heavy_preloaded = False
         self.child_cpu_total = 0.0
         self.last_timings = None
+        self.last_cal_state = None
 
     def _ensure_heavy_third_party(self) -> None:
         """Pre-import numpy, pandas, duckdb ONCE in parent (verified OS num_threads == 1)."""
@@ -582,6 +698,8 @@ class ForkRunner:
                 if msg and len(msg) > 2:
                     self.child_cpu_total += msg[2]
                     self.last_timings = msg[3] if len(msg) > 3 else None
+                    if len(msg) > 4 and msg[4] is not None:
+                        self.last_cal_state = msg[4]
                 if msg and msg[0] in ("ok", "import_err"):
                     return msg[0], msg[1]
                 if not (msg and msg[0] == "need_tier0"):
@@ -613,6 +731,8 @@ class ForkRunner:
             if msg and len(msg) > 2:
                 self.child_cpu_total += msg[2]
                 self.last_timings = msg[3] if len(msg) > 3 else None
+                if len(msg) > 4 and msg[4] is not None:
+                    self.last_cal_state = msg[4]
             if msg and msg[0] in ("ok", "import_err"):
                 return msg[0], msg[1]
             return ("ok", [n for n, _ in job["tests"]])
@@ -722,6 +842,7 @@ class BlastRadiusSelector:
         self.lazy_load_num = self.by_id.get(TEST_LAZY_LOAD)
 
         self.runner = ForkRunner()
+        self._cal_state: tuple[float, float, int, float] = (400.0, 400.0, 10, 15.0)
         self._orig_cache: dict[str, str | None] = {}
         self._external_read_cache: dict[tuple[str, str], bool] = {}
         self._batch_t0 = time.monotonic()
@@ -1017,7 +1138,7 @@ class BlastRadiusSelector:
                 and not edit.is_added_or_deleted
             ):
                 if not edit.class_level_edits and not edit.module_level_edit:
-                    inv_op = detect_single_invariant_op_edit(orig_text, new_text)
+                    inv_op = edit.single_inv_op
                     if inv_op is not None:
                         single_inv_site = (rel, inv_op[0], inv_op[1], inv_op[2])
                 elif (
@@ -1461,6 +1582,13 @@ class BlastRadiusSelector:
             if heavy_cands:
                 rest_cands = candidates - set(heavy_cands)
                 quick_cpu = {n: max(50.0, self.dur_ms[n] * 0.25) for n in heavy_cands}
+                for test_id, ratio in (
+                    (TEST_OPTIMIZER_TPCDS, OPTIMIZER_TPCDS_CPU_RATIO),
+                    (TEST_OPTIMIZER_SCOPE, OPTIMIZER_SCOPE_CPU_RATIO),
+                ):
+                    n = self.by_id.get(test_id)
+                    if n in quick_cpu:
+                        quick_cpu[n] = self.dur_ms[n] * ratio
                 quick_job = {
                     "patched_files": patched_files,
                     "check_import_rels": [],
@@ -1866,18 +1994,33 @@ class BlastRadiusSelector:
         elif early_stage == -1:
             _stage_scale = 0.12
         elif early_stage == 0:
-            _stage_scale = 0.60
+            _stage_scale = 0.65
         elif early_stage <= 4:
-            _stage_scale = 0.82
+            _stage_scale = 0.90
         else:
-            _stage_scale = 0.95
+            _stage_scale = 0.97
+        # Measured server-CPU / tests.json ratios for Pool-parallelized or DuckDB-cached optimizer tests
+        _opt_base_ratio = {
+            "test_optimize": 1.80,
+            "test_tpch": 1.65,
+            "test_simplify": 1.50,
+            "test_qualify_columns": 1.14,
+            "test_annotate_funcs": 1.03,
+            "test_canonicalize": 0.08,
+            "test_merge_subqueries": 0.88,
+            "test_unnest_subqueries": 1.07,
+            "test_qualify_struct_star_long_cte_chain": 1.11,
+            "test_deep_ast_type_annotation": 1.16,
+            "test_qualify_semi_anti_join_alias_shadowing_column": 0.60,
+        }
         verification_cpu_ms: dict[int, float] = {}
-        opt_tpcds_num = self.by_id.get("tests/test_optimizer.py::TestOptimizer::test_tpcds")
-        scope_num = self.by_id.get("tests/test_optimizer.py::TestOptimizer::test_scope")
+        opt_tpcds_num = self.by_id.get(TEST_OPTIMIZER_TPCDS)
+        scope_num = self.by_id.get(TEST_OPTIMIZER_SCOPE)
         cache_num = self.by_id.get("tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries")
         agg_order_num = self.by_id.get("tests/test_executor.py::TestExecutor::test_agg_order")
         rs_values_num = self.by_id.get("tests/dialects/test_redshift.py::TestRedshift::test_values")
         serde_num = self.by_id.get("tests/test_serde.py::TestSerde::test_serde")
+        recursion_num = self.by_id.get("tests/test_serde.py::TestSerde::test_recursion")
         transpile_id_num = self.by_id.get("tests/test_transpile.py::TestTranspile::test_identity")
         transpile_pretty_num = self.by_id.get("tests/test_transpile.py::TestTranspile::test_pretty")
         cross_join_num = self.by_id.get("tests/test_optimize_cross_joins.py::TestOptimizeCrossJoins::test_conditional_cross_joins")
@@ -1887,12 +2030,12 @@ class BlastRadiusSelector:
             tid = info["id"]
             mname = tid.rsplit("::", 1)[-1]
             if n == self.max_nodes_num and max_nodes_fast_arg:
-                verification_cpu_ms[n] = 3500.0 if parser_max_nodes_touched else 40.0
+                verification_cpu_ms[n] = 3500.0 if parser_max_nodes_touched else 150.0
             elif n == self.tpcds_num:
                 if tpcds_fixture_override is not None:
                     verification_cpu_ms[n] = 100.0
                 elif tpcds_fast_arg is not None:
-                    verification_cpu_ms[n] = min(2500.0, self.dur_ms[n] * 0.12)
+                    verification_cpu_ms[n] = min(3000.0, self.dur_ms[n] * 0.14)
                 else:
                     verification_cpu_ms[n] = self.dur_ms[n] * 0.90
             elif n == self.tpch_num and (tpch_fast_arg or tpch_fixture_override is not None):
@@ -1900,31 +2043,33 @@ class BlastRadiusSelector:
             elif n == self.opt_tpch_num and (opt_tpch_hashes_arg is not None or tpch_fixture_override is not None):
                 verification_cpu_ms[n] = 80.0
             elif n == self.gen_mem_num and gen_mem_fast_arg:
-                verification_cpu_ms[n] = 20.0 * len(gen_mem_dialects_arg) if gen_mem_dialects_arg else 350.0
+                verification_cpu_ms[n] = 20.0 * len(gen_mem_dialects_arg) if gen_mem_dialects_arg else 450.0
             elif n == opt_tpcds_num:
                 if fixture_index_masks and "optimizer/tpc-ds/tpc-ds.sql" in fixture_index_masks:
                     tot_p = max(1, self._fixture_pair_counts.get("optimizer/tpc-ds/tpc-ds.sql", 99))
                     frac = fixture_index_masks["optimizer/tpc-ds/tpc-ds.sql"].bit_count() / tot_p
-                    verification_cpu_ms[n] = max(10.0, self.dur_ms[n] * 1.60 * frac * _stage_scale)
+                    verification_cpu_ms[n] = max(15.0, self.dur_ms[n] * OPTIMIZER_TPCDS_CPU_RATIO * frac * _stage_scale)
                 elif opt_dialect_filter:
-                    verification_cpu_ms[n] = max(15.0, self.dur_ms[n] * 0.25)
+                    verification_cpu_ms[n] = max(20.0, self.dur_ms[n] * 0.35)
                 else:
-                    verification_cpu_ms[n] = self.dur_ms[n] * 1.60 * _stage_scale
+                    verification_cpu_ms[n] = self.dur_ms[n] * OPTIMIZER_TPCDS_CPU_RATIO * _stage_scale
             elif n == scope_num:
                 if skip_scope_stress:
-                    verification_cpu_ms[n] = 180.0
+                    verification_cpu_ms[n] = 220.0
                 elif opt_dialect_filter == {"bigquery"}:
                     verification_cpu_ms[n] = 20.0
                 else:
-                    verification_cpu_ms[n] = self.dur_ms[n] * 0.80
+                    verification_cpu_ms[n] = self.dur_ms[n] * OPTIMIZER_SCOPE_CPU_RATIO
             elif n == cache_num:
-                verification_cpu_ms[n] = 40.0
+                verification_cpu_ms[n] = 230.0
             elif n == agg_order_num:
-                verification_cpu_ms[n] = 10.0
-            elif n == rs_values_num and skip_redshift_values_stress:
-                verification_cpu_ms[n] = 30.0
+                verification_cpu_ms[n] = 15.0
+            elif n == rs_values_num:
+                verification_cpu_ms[n] = 30.0 if skip_redshift_values_stress else self.dur_ms[n] * 1.18
+            elif n == recursion_num:
+                verification_cpu_ms[n] = self.dur_ms[n] * 1.20
             elif n == cross_join_num and "tests/test_optimize_cross_joins.py" not in patched_files:
-                verification_cpu_ms[n] = max(15.0, self.dur_ms[n] * 0.65 * _stage_scale)
+                verification_cpu_ms[n] = max(20.0, self.dur_ms[n] * 1.30 * _stage_scale)
             elif n in (serde_num, transpile_id_num) and fixture_index_masks and "identity.sql" in fixture_index_masks:
                 tot_i = max(1, self._fixture_pair_counts.get("identity.sql", 980))
                 frac = fixture_index_masks["identity.sql"].bit_count() / tot_i
@@ -1945,32 +2090,97 @@ class BlastRadiusSelector:
                     verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * frac)
             elif file == "tests/test_optimizer.py":
                 fix_name = _opt_test_to_fixture.get(mname)
+                base_r = _opt_base_ratio.get(mname, 0.90)
                 if fix_name and fixture_index_masks and fix_name in fixture_index_masks:
                     tot_f = max(1, self._fixture_pair_counts.get(fix_name, 1))
                     frac = fixture_index_masks[fix_name].bit_count() / tot_f
                     scale = _stage_scale if mname in ("test_optimize", "test_tpch", "test_merge_subqueries", "test_canonicalize") else 1.0
-                    verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * 0.90 * frac * scale)
+                    verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * base_r * frac * scale)
                 elif opt_dialect_filter and fix_name:
                     verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * 0.25)
                 elif mname in _db_cached_opt_tests and "tests/test_optimizer.py" not in patched_files:
-                    verification_cpu_ms[n] = max(10.0, self.dur_ms[n] * 0.65 * _stage_scale)
+                    verification_cpu_ms[n] = max(10.0, self.dur_ms[n] * 0.90 * _stage_scale)
                 else:
-                    verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * 0.85)
+                    verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * base_r)
             elif file.startswith("tests/dialects/") and dialect_filter:
                 verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * 0.25)
             else:
                 verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * 0.85)
 
+        probe_set: set[int] = set()
         if normal_cands:
-            if len(candidates) > 200:
-                for n in normal_cands:
-                    if verification_cpu_ms.get(n, 0.0) < 5.0:
-                        verification_cpu_ms[n] = 5.0
-            # Verify high-ROI (sliced/cheap) normal candidates FIRST in descending dur_ms, then unsliced descending!
+            normal_est_total = sum(verification_cpu_ms.get(n, 0.0) for n in normal_cands)
+            probe_list: list[int] = []
+            if len(normal_cands) >= 30 and normal_est_total >= 1200.0:
+                primary_files: set[str] = set()
+                for rf in real_code_files:
+                    if rf in ("sqlglot/parser.py", "sqlglot/parsers/base.py", "sqlglot/tokenizer_core.py", "sqlglot/tokens.py"):
+                        primary_files.update(("tests/test_parser.py", "tests/test_transpile.py"))
+                    elif rf in ("sqlglot/generator.py", "sqlglot/generators/base.py"):
+                        primary_files.update(("tests/test_generator.py", "tests/test_transpile.py"))
+                    elif rf.startswith("sqlglot/optimizer/"):
+                        primary_files.add("tests/test_optimizer.py")
+                    elif rf.startswith("sqlglot/expressions/"):
+                        primary_files.update(("tests/test_expressions.py", "tests/test_parser.py"))
+                    elif rf == "sqlglot/dialects/dialect.py":
+                        primary_files.add("tests/dialects/test_dialect.py")
+                    elif rf.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/")):
+                        st = Path(rf).stem
+                        primary_files.add(f"tests/dialects/test_{st}.py")
+                    elif rf.startswith("sqlglot/executor/") or rf == "sqlglot/planner.py":
+                        primary_files.add("tests/test_executor.py")
+                    elif rf == "sqlglot/schema.py":
+                        primary_files.add("tests/test_schema.py")
+                    elif rf == "sqlglot/lineage.py":
+                        primary_files.add("tests/test_lineage.py")
+                    elif rf == "sqlglot/diff.py":
+                        primary_files.add("tests/test_diff.py")
+                    elif rf == "sqlglot/serde.py":
+                        primary_files.add("tests/test_serde.py")
+
+                probe_cands = [
+                    n for n in normal_cands
+                    if n != opt_tpcds_num
+                    and verification_cpu_ms.get(n, 999.0) <= 30.0
+                    and self.dur_ms[n] <= 300
+                ]
+                probe_cands.sort(
+                    key=lambda x: (
+                        0 if self.by_num[x]["file"] in primary_files else 1,
+                        0 if verification_cpu_ms.get(x, self.dur_ms[x]) < self.dur_ms[x] * 0.45 else 1,
+                        -(self.dur_ms[x] / max(verification_cpu_ms.get(x, 1.0), 1.0)),
+                        verification_cpu_ms.get(x, 1.0),
+                    )
+                )
+                per_file_cnt: dict[str, int] = {}
+                probe_budget = 0.0
+                for n in probe_cands:
+                    f = self.by_num[n]["file"]
+                    if per_file_cnt.get(f, 0) >= 6:
+                        continue
+                    est_n = verification_cpu_ms.get(n, 1.0)
+                    if probe_list and probe_budget + est_n > 200.0:
+                        continue
+                    probe_list.append(n)
+                    probe_set.add(n)
+                    per_file_cnt[f] = per_file_cnt.get(f, 0) + 1
+                    probe_budget += est_n
+                    if len(probe_list) >= 16:
+                        break
+
+            for n in probe_list:
+                verify_list.append((n, self.by_num[n]["id"]))
+
+            rest_normal = [n for n in normal_cands if n not in probe_set]
+            # Tier C: high-ROI (sliced/cheap) tests first in descending dur_ms;
+            # Tier D: unsliced/low-ROI tests in descending ROI (dur_ms / est_cpu), worst-ROI last!
             for n in sorted(
-                normal_cands,
+                rest_normal,
                 key=lambda x: (
-                    0 if verification_cpu_ms.get(x, self.dur_ms[x]) < self.dur_ms[x] * 0.45 else 1,
+                    0 if verification_cpu_ms.get(x, self.dur_ms[x]) < self.dur_ms[x] * 0.65 else 1,
+                    -self.dur_ms[x]
+                    if verification_cpu_ms.get(x, self.dur_ms[x]) < self.dur_ms[x] * 0.65
+                    else -(self.dur_ms[x] / max(verification_cpu_ms.get(x, 1.0), 1.0)),
                     -self.dur_ms[x],
                 ),
             ):
@@ -2008,14 +2218,17 @@ class BlastRadiusSelector:
                     )
                 )
             )
+            # Only pull test_tpcds ahead of test_execute_tpcds to share RULES[0..6] when test_tpcds itself
+            # is cheap enough to be worth running (not a 6-7s unsliced server CPU burn!).
+            cal_sc_now = min(3.0, max(0.25, self._cal_state[1] / max(self._cal_state[0], 1.0)))
+            opt_tpcds_cal_est = (
+                verification_cpu_ms.get(opt_tpcds_num, 99999.0) * cal_sc_now
+                if opt_tpcds_num is not None
+                else 99999.0
+            )
             allow_share_tpcds = bool(
-                opt_dialect_filter
-                or early_stage == -1
-                or (
-                    fixture_index_masks is not None
-                    and "optimizer/tpc-ds/tpc-ds.sql" in fixture_index_masks
-                    and fixture_index_masks["optimizer/tpc-ds/tpc-ds.sql"].bit_count() <= 40
-                )
+                opt_tpcds_num is not None
+                and opt_tpcds_cal_est <= 2600.0
             )
             job = {
                 "patched_files": patched_files,
@@ -2049,12 +2262,23 @@ class BlastRadiusSelector:
                 "allow_share_tpcds": allow_share_tpcds,
                 "context_table_only": context_table_only,
                 "tests": verify_list,
+                "probe_nums": probe_set,
+                "cal_state": self._cal_state,
                 "dur_ms_map": {n: self.dur_ms[n] for n in candidates},
                 "verification_cpu_ms": verification_cpu_ms,
                 "auto_include": auto_include,
-                "cpu_cap": 22.0,
+                "cpu_cap": 16.0,
             }
             status, payload = self.runner.run_job(job, need_tier0=need_tier0)
+            if self.runner.last_cal_state is not None:
+                ce, ca, tc, tm = self.runner.last_cal_state
+                if ce > 8000.0:
+                    ce *= 0.5
+                    ca *= 0.5
+                if tc > 400:
+                    tc //= 2
+                    tm *= 0.5
+                self._cal_state = (ce, ca, tc, tm)
             if status == "import_err":
                 # Runtime import-time crash (e.g. NameError/ZeroDivisionError in class body)!
                 expanded_err: set[int] = set(final_failing)
@@ -2075,6 +2299,7 @@ class BlastRadiusSelector:
                         "opt_tpch_hashes": self.tpch_opt_duckdb_hashes if (not tpch_inputs_touched and self.tpch_opt_duckdb_hashes) else None,
                         "duckdb_passing_pairs": self.duckdb_passing_pairs if "tests/test_optimizer.py" not in patched_files else None,
                         "tests": err_tests,
+                        "cal_state": self._cal_state,
                         "dur_ms_map": {n: self.dur_ms[n] for n in expanded_err},
                         "verification_cpu_ms": err_cpu,
                         "cpu_cap": 15.0,

@@ -230,6 +230,8 @@ class PyEditInfo:
     # Exact runtime reads and the name to check for consumers outside this module.
     const_reader_lines: set[int] | None = None
     const_reader_symbol: str | None = None
+    # Single pure operator swap (`is`<->`==`, `<`<->`<=`, `if A and/or B:`) inside one function body.
+    single_inv_op: tuple[str, int, int] | None = None
 
 
 def _node_span(node: ast.AST) -> tuple[int, int]:
@@ -350,7 +352,16 @@ def analyze_python_edit(
     unchanged_funcs: set[str] = set()
     for qn, ofn in orig_funcs.items():
         nfn = new_funcs.get(qn)
-        if nfn is not None and ast.dump(ofn, include_attributes=False) == ast.dump(nfn, include_attributes=False):
+        if nfn is None:
+            continue
+        os_, oe_ = _node_span(ofn)
+        ns_, ne_ = _node_span(nfn)
+        if not (
+            any(os_ <= ln <= oe_ for ln in orig_changed)
+            or any(ns_ <= ln <= ne_ for ln in new_changed)
+        ):
+            continue
+        if ast.dump(ofn, include_attributes=False) == ast.dump(nfn, include_attributes=False):
             unchanged_funcs.add(qn)
 
     def _first_exec_line(fn_node: ast.AST) -> int | None:
@@ -581,6 +592,20 @@ def analyze_python_edit(
 
     if (info.module_level_edit or info.class_attr_edits) and not info.enclosing_funcs:
         _analyze_const_readers(orig_ast, new_ast, info)
+
+    # Fast single-operator invariant edit detection reusing already-parsed single edited function!
+    if (
+        not info.module_level_edit
+        and not info.class_level_edits
+        and len(info.enclosing_funcs) == 1
+        and len(orig_changed) <= 3
+        and len(new_changed) <= 3
+    ):
+        qn = next(iter(info.enclosing_funcs))
+        ofn = orig_funcs.get(qn)
+        nfn = new_funcs.get(qn)
+        if ofn is not None and nfn is not None and _raw_lines_may_be_inv_op(orig_text, new_text, orig_changed, new_changed):
+            info.single_inv_op = _find_single_invariant_op_in_nodes(ofn, nfn)
 
     return info
 
@@ -1065,15 +1090,45 @@ _BOOL_OP_PAIRS = {
 }
 
 
-def detect_single_invariant_op_edit(orig_text: str, new_text: str) -> tuple[str, int, int] | None:
-    """If the ENTIRE file diff is swapping a single pure operator (`is`<->`==`, `<`<->`<=`, or `if A and/or B:`),
-    return `(kind, orig_lineno, orig_col_offset)` where kind in {'is', 'ord', 'bool'}. Otherwise None."""
-    try:
-        orig_ast = ast.parse(orig_text)
-        new_ast = ast.parse(new_text)
-    except SyntaxError:
-        return None
+_INV_OP_RE = re.compile(r"\b(?:is|and|or)\b|==|!=|<=|>=|<|>")
 
+
+def _raw_lines_may_be_inv_op(
+    orig_text: str,
+    new_text: str,
+    orig_changed: set[int],
+    new_changed: set[int],
+) -> bool:
+    orig_lines = orig_text.splitlines()
+    new_lines = new_text.splitlines()
+    o_hit = any(
+        1 <= ln <= len(orig_lines) and _INV_OP_RE.search(orig_lines[ln - 1])
+        for ln in orig_changed
+    )
+    if not o_hit:
+        return False
+    return any(
+        1 <= ln <= len(new_lines) and _INV_OP_RE.search(new_lines[ln - 1])
+        for ln in new_changed
+    )
+
+
+def _ast_equal(a: object, b: object) -> bool:
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for f in a._fields:
+            if not _ast_equal(getattr(a, f), getattr(b, f)):
+                return False
+        return True
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        return all(_ast_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _find_single_invariant_op_in_nodes(orig_node: ast.AST, new_node: ast.AST) -> tuple[str, int, int] | None:
     found: list[tuple[str, int, int]] = []
     aborted = False
 
@@ -1085,15 +1140,12 @@ def detect_single_invariant_op_edit(orig_text: str, new_text: str) -> tuple[str,
             aborted = True
             return
         if isinstance(o, ast.AST):
-            # Fast skip identical subtrees!
-            if ast.dump(o, include_attributes=False) == ast.dump(n, include_attributes=False):
-                return
             if isinstance(o, ast.Compare) and len(o.ops) == 1 and len(n.ops) == 1:
                 pair = (type(o.ops[0]), type(n.ops[0]))
                 if (
                     (pair in _IS_OP_PAIRS or pair in _ORD_OP_PAIRS)
-                    and ast.dump(o.left, include_attributes=False) == ast.dump(n.left, include_attributes=False)
-                    and ast.dump(o.comparators[0], include_attributes=False) == ast.dump(n.comparators[0], include_attributes=False)
+                    and _ast_equal(o.left, n.left)
+                    and _ast_equal(o.comparators[0], n.comparators[0])
                 ):
                     kind = "is" if pair in _IS_OP_PAIRS else "ord"
                     found.append((kind, o.lineno, o.col_offset))
@@ -1107,12 +1159,10 @@ def detect_single_invariant_op_edit(orig_text: str, new_text: str) -> tuple[str,
                 and len(o.test.values) == 2
                 and len(n.test.values) == 2
                 and (type(o.test.op), type(n.test.op)) in _BOOL_OP_PAIRS
-                and ast.dump(o.test.values[0], include_attributes=False) == ast.dump(n.test.values[0], include_attributes=False)
-                and ast.dump(o.test.values[1], include_attributes=False) == ast.dump(n.test.values[1], include_attributes=False)
-                and len(o.body) == len(n.body)
-                and len(o.orelse) == len(n.orelse)
-                and all(ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False) for a, b in zip(o.body, n.body))
-                and all(ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False) for a, b in zip(o.orelse, n.orelse))
+                and _ast_equal(o.test.values[0], n.test.values[0])
+                and _ast_equal(o.test.values[1], n.test.values[1])
+                and _ast_equal(o.body, n.body)
+                and _ast_equal(o.orelse, n.orelse)
             ):
                 found.append(("bool", o.test.lineno, o.test.col_offset))
                 if len(found) > 1:
@@ -1130,7 +1180,18 @@ def detect_single_invariant_op_edit(orig_text: str, new_text: str) -> tuple[str,
             if o != n:
                 aborted = True
 
-    _walk(orig_ast, new_ast)
+    _walk(orig_node, new_node)
     if aborted or len(found) != 1:
         return None
     return found[0]
+
+
+def detect_single_invariant_op_edit(orig_text: str, new_text: str) -> tuple[str, int, int] | None:
+    """If the ENTIRE file diff is swapping a single pure operator (`is`<->`==`, `<`<->`<=`, or `if A and/or B:`),
+    return `(kind, orig_lineno, orig_col_offset)` where kind in {'is', 'ord', 'bool'}. Otherwise None."""
+    try:
+        orig_ast = ast.parse(orig_text)
+        new_ast = ast.parse(new_text)
+    except SyntaxError:
+        return None
+    return _find_single_invariant_op_in_nodes(orig_ast, new_ast)
