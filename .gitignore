@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 tpcds_tables.pkl
 tpcds_tables/
+tpcds_plans_fast/

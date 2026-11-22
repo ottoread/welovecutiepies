@@ -8,6 +8,7 @@ import gzip
 import os
 import pickle
 import sys
+import zlib
 from pathlib import Path
 
 SQLGLOT_ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/app/sqlglot")).resolve()
@@ -47,6 +48,69 @@ def _load_csv_rows(file_name: str) -> list[tuple]:
     return rows
 
 
+def _build_fast_plans() -> None:
+    plans_path = APP_DIR / "tpcds_plans.zlib"
+    if not plans_path.is_file():
+        return
+    from sqlglot import exp, planner
+
+    raw_plans = pickle.loads(plans_path.read_bytes())
+
+    def enc(obj):
+        if isinstance(obj, exp.Expr):
+            return (
+                "_E",
+                type(obj).__name__,
+                {k: enc(v) for k, v in obj.args.items()},
+                obj.comments,
+                enc(obj._type) if obj._type is not None else None,
+                obj._meta,
+            )
+        if isinstance(obj, list):
+            return [enc(x) for x in obj]
+        if isinstance(obj, tuple):
+            return tuple(enc(x) for x in obj)
+        if isinstance(obj, dict):
+            return {enc(k): enc(v) for k, v in obj.items()}
+        if isinstance(obj, set):
+            return {enc(x) for x in obj}
+        return obj
+
+    def enc_plan(plan):
+        step_map = {}
+
+        def enc_step(st):
+            sid = id(st)
+            if sid in step_map:
+                return step_map[sid]
+            new_st = object.__new__(type(st))
+            step_map[sid] = new_st
+            for k, v in st.__dict__.items():
+                if k in ("dependencies", "dependents"):
+                    setattr(new_st, k, {enc_step(s) for s in v})
+                else:
+                    setattr(new_st, k, enc(v))
+            return new_st
+
+        np = object.__new__(planner.Plan)
+        np.expression = None
+        np.ctes = enc(getattr(plan, "ctes", None))
+        np.root = enc_step(plan.root)
+        np._dag = None
+        return np
+
+    out_dir = APP_DIR / "tpcds_plans_fast"
+    out_dir.mkdir(exist_ok=True)
+    total_bytes = 0
+    for idx, blob in raw_plans.items():
+        p = pickle.loads(zlib.decompress(blob))
+        fp = out_dir / f"{idx}.pkl"
+        data = pickle.dumps(enc_plan(p), protocol=pickle.HIGHEST_PROTOCOL)
+        fp.write_bytes(data)
+        total_bytes += len(data)
+    print(f"Built {out_dir} ({total_bytes / 1024:.1f} KB, {len(raw_plans)} plans)", file=sys.stderr)
+
+
 def main() -> None:
     os.chdir(SQLGLOT_ROOT)
     from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA
@@ -62,6 +126,7 @@ def main() -> None:
             pickle.dump(rows, f, protocol=pickle.HIGHEST_PROTOCOL)
         total_bytes += p.stat().st_size
     print(f"Built {out_dir} ({total_bytes / 1024:.1f} KB, {len(TPCDS_SCHEMA)} tables)", file=sys.stderr)
+    _build_fast_plans()
 
 
 if __name__ == "__main__":

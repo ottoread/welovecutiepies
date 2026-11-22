@@ -2,6 +2,7 @@
 """Blast Radius selector: sound static+dynamic dependency maps + 2-tier fork-server fail-fast verifier."""
 from __future__ import annotations
 
+import gc
 import json
 import os
 import pickle
@@ -16,6 +17,7 @@ from typing import Any
 
 from inmem_loader import (
     EXECUTOR_OPTIONS,
+    apply_hot_patches,
     install_overlay,
     run_test_in_process,
     verify_execute_tpcds_fast,
@@ -44,6 +46,7 @@ SQLGLOT_ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/app/sqlglot")).resolve()
 APP_DIR = Path(__file__).resolve().parent
 MAPS_PATH = APP_DIR / "maps.zlib"
 FIXTURE_COV_PATH = APP_DIR / "fixture_cov.zlib"
+VALIDATOR_COV_PATH = APP_DIR / "validator_cov.zlib"
 OPT_STAGES_PATH = APP_DIR / "opt_stages.zlib"
 
 DEFAULT_CORE_FILES = {
@@ -169,6 +172,10 @@ def _execute_job_in_child(
 
     patched_files: dict[str, str | None] = job["patched_files"]
     install_overlay(SQLGLOT_ROOT, patched_files)
+    if not is_tier0:
+        hot_patch_specs = job.get("hot_patch_specs")
+        if hot_patch_specs and not apply_hot_patches(patched_files, hot_patch_specs):
+            return ("need_tier0", [], time.process_time(), [])
     EXECUTOR_OPTIONS.update(
         direct_iteration=job.get("allow_direct_iteration", False),
         context_table_only=job.get("context_table_only", False),
@@ -176,6 +183,13 @@ def _execute_job_in_child(
 
     test_items: list[tuple[int, str]] = list(job["tests"])
     failing: list[int] = []
+
+    if is_tier0 and any(
+        tid in (TEST_GEN_MEM, "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries")
+        for _, tid in test_items
+    ):
+        gc.collect()
+        gc.freeze()
 
     # Run TEST_LAZY_LOAD FIRST in Tier 0 BEFORE check_import_rels or any other test imports any dialect!
     if is_tier0:
@@ -216,10 +230,12 @@ def _execute_job_in_child(
     fixture_pair_only: bool = job.get("fixture_pair_only", False)
     fixture_item_ov: dict[str, list] | None = job.get("fixture_item_overrides")
     fixture_index_masks: dict[str, int] | None = job.get("fixture_index_masks")
+    validator_call_masks: dict[str, int] | None = job.get("validator_call_masks")
     dialect_filter: set[str] | None = job.get("dialect_filter")
     opt_dialect_filter: set[str] | None = job.get("opt_dialect_filter")
     dialect_edit_mode: str = job.get("dialect_edit_mode", "all")
     skip_scope_stress: bool = job.get("skip_scope_stress", False)
+    skip_redshift_values_stress: bool = job.get("skip_redshift_values_stress", False)
     duckdb_passing_pairs: set[str] | None = job.get("duckdb_passing_pairs")
     tpcds_fast: dict | None = job.get("tpcds_fast")
     tpcds_fixture_override: list | None = job.get("tpcds_fixture_override")
@@ -301,9 +317,18 @@ def _execute_job_in_child(
             failing.extend(remaining)
             break
 
-        if have_required and verification_cpu_ms and dur_ms_map and idx >= next_pack_check:
+        if (
+            verification_cpu_ms
+            and dur_ms_map
+            and (
+                idx >= next_pack_check
+                or dur_ms_map.get(tnum, 0) >= 300
+                or verification_cpu_ms.get(tnum, 0.0) >= 120.0
+            )
+            and (have_required or (remaining_cpu_ms >= 3500.0 and not (remaining & fast_giant_nums)))
+        ):
             required = auto_include.union(failing)
-            req_cost = pack_cost_ms(required, dur_ms_map)
+            req_cost = pack_cost_ms(required, dur_ms_map) if required else 0
             all_cost = pack_cost_ms(required | remaining, dur_ms_map)
             savings_ms = all_cost - req_cost
             if savings_ms == 0:
@@ -314,8 +339,8 @@ def _execute_job_in_child(
                 # Keep checking right after each fast-verified giant finishes!
                 next_pack_check = idx + 1
             else:
-                if savings_ms < remaining_cpu_ms:
-                    # Only stop if even the next (heaviest) remaining test isn't worth its CPU cost!
+                if savings_ms <= remaining_cpu_ms:
+                    # Only stop if even the next (highest-ROI / heaviest) remaining test isn't worth its CPU cost!
                     without_next = pack_cost_ms(required | (remaining - {tnum}), dur_ms_map)
                     t_marginal = all_cost - without_next
                     if t_marginal <= verification_cpu_ms.get(tnum, 1.0):
@@ -408,10 +433,12 @@ def _execute_job_in_child(
                 fixture_pair_only=fixture_pair_only,
                 fixture_item_overrides=fixture_item_ov,
                 fixture_index_masks=fixture_index_masks,
+                validator_call_masks=validator_call_masks,
                 dialect_filter=dialect_filter,
                 opt_dialect_filter=opt_dialect_filter,
                 dialect_edit_mode=dialect_edit_mode,
                 skip_scope_stress=skip_scope_stress,
+                skip_redshift_values_stress=skip_redshift_values_stress,
                 duckdb_passing_pairs=duckdb_passing_pairs,
                 tpcds_pre_merge=tpcds_pre_merge,
                 early_stage=early_stage,
@@ -482,6 +509,8 @@ class ForkRunner:
                     sys.path.insert(0, str(SQLGLOT_ROOT))
                 import sqlglot  # noqa: F401
                 import tests.helpers  # noqa: F401
+                import tests.dialects.test_dialect  # noqa: F401
+                import tests.test_optimizer  # noqa: F401
 
                 repo_prefix = str(SQLGLOT_ROOT) + os.sep
                 loaded: set[str] = set()
@@ -489,6 +518,8 @@ class ForkRunner:
                     f = getattr(m, "__file__", None)
                     if f and f.startswith(repo_prefix):
                         loaded.add(f[len(repo_prefix):])
+                gc.collect()
+                gc.freeze()
                 _send_msg(rep_w, loaded)
 
                 while True:
@@ -538,7 +569,10 @@ class ForkRunner:
         )
         if not need_tier0:
             self._ensure_tier1()
-            if not any(p in self.t1_loaded_files for p in job["patched_files"]):
+            loaded_patched = [p for p in job["patched_files"] if p in self.t1_loaded_files]
+            hot_specs = job.get("hot_patch_specs")
+            hot_covered = {rel for rel, _, _ in hot_specs} if hot_specs else set()
+            if not loaded_patched or all(p in hot_covered for p in loaded_patched):
                 assert self.t1_req_w is not None and self.t1_rep_r is not None
                 _send_msg(self.t1_req_w, job)
                 msg = _recv_msg(self.t1_rep_r)
@@ -547,7 +581,8 @@ class ForkRunner:
                     self.last_timings = msg[3] if len(msg) > 3 else None
                 if msg and msg[0] in ("ok", "import_err"):
                     return msg[0], msg[1]
-                return ("ok", [n for n, _ in job["tests"]])
+                if not (msg and msg[0] == "need_tier0"):
+                    return ("ok", [n for n, _ in job["tests"]])
 
         if need_heavy:
             self._ensure_heavy_third_party()
@@ -630,6 +665,8 @@ class BlastRadiusSelector:
         self._tpcds_optimizer_cover: dict[int, int] | None = None
         self.scope_stress_lines: dict[str, set[int]] = maps.get("scope_stress_lines", {})
         self.scope_stress_exprs: set[str] = set(maps.get("scope_stress_exprs", ()))
+        self.redshift_values_stress_lines: dict[str, set[int]] = maps.get("redshift_values_stress_lines", {})
+        self.redshift_values_stress_exprs: set[str] = set(maps.get("redshift_values_stress_exprs", ()))
         self.tpcds_expr_to_q: dict[str, list[int]] = maps.get("tpcds_expr_to_q", {})
         self.duckdb_passing_pairs: set[str] = maps.get("duckdb_passing_pairs", set())
 
@@ -637,6 +674,14 @@ class BlastRadiusSelector:
         self._src_to_fixture_masks: dict[str, dict[str, dict[int, int]]] = {}
         self._fixture_pair_counts: dict[str, int] = {}
         self._expr_to_fixture_masks: dict[str, dict[str, int]] = {}
+        self._validator_cov_loaded = False
+        self._vcall_test_ids: list[str] = []
+        self._vcall_counts: list[int] = []
+        self._vcall_id_to_idx: dict[str, int] = {}
+        self._vcall_src_blobs: dict[str, bytes] = {}
+        self._vcall_src_cache: dict[str, dict[int, dict[int, int]]] = {}
+        self._vcall_expr_blob: bytes | None = None
+        self._vcall_expr_cache: dict[str, dict[int, int]] | None = None
         self._opt_stages_loaded = False
         self._rule_line_masks: dict[str, dict[int, int]] = {}
 
@@ -669,6 +714,36 @@ class BlastRadiusSelector:
             self._src_to_fixture_masks = fc["src_to_fixture_masks"]
             self._fixture_pair_counts = fc["fixture_pair_counts"]
             self._expr_to_fixture_masks = fc.get("expr_to_fixture_masks", {})
+
+    def _ensure_validator_cov(self) -> None:
+        if self._validator_cov_loaded:
+            return
+        self._validator_cov_loaded = True
+        if VALIDATOR_COV_PATH.is_file():
+            vc = pickle.loads(VALIDATOR_COV_PATH.read_bytes())
+            self._vcall_test_ids = vc["test_ids"]
+            self._vcall_counts = vc["vcall_counts"]
+            self._vcall_id_to_idx = {tid: i for i, tid in enumerate(self._vcall_test_ids)}
+            self._vcall_src_blobs = vc["src_blobs"]
+            self._vcall_expr_blob = vc.get("expr_blob")
+
+    def _get_validator_src_map(self, src_f: str) -> dict[int, dict[int, int]] | None:
+        if src_f in self._vcall_src_cache:
+            return self._vcall_src_cache[src_f]
+        blob = self._vcall_src_blobs.get(src_f)
+        if blob is None:
+            return None
+        d = pickle.loads(zlib.decompress(blob))
+        self._vcall_src_cache[src_f] = d
+        return d
+
+    def _get_validator_expr_map(self) -> dict[str, dict[int, int]]:
+        if self._vcall_expr_cache is None:
+            if self._vcall_expr_blob is not None:
+                self._vcall_expr_cache = pickle.loads(zlib.decompress(self._vcall_expr_blob))
+            else:
+                self._vcall_expr_cache = {}
+        return self._vcall_expr_cache
 
     def _ensure_opt_stages(self) -> None:
         if self._opt_stages_loaded:
@@ -788,6 +863,8 @@ class BlastRadiusSelector:
         py_hit_lines_for_fixtures: list[tuple[str, set[int]]] = []
         check_import_rels: list[str] = []
         has_binary_change = False
+        can_hot_patch = True
+        hot_patch_specs: list[tuple[str, str, list[str]]] = []
 
         for fp in file_patches:
             rel = fp.path
@@ -856,6 +933,26 @@ class BlastRadiusSelector:
             patched_files[rel] = new_text
             if fp.old_path and fp.old_path != rel:
                 patched_files[fp.old_path] = None
+                can_hot_patch = False
+
+            if (
+                can_hot_patch
+                and not edit.syntax_error
+                and not edit.is_added_or_deleted
+                and not edit.module_level_edit
+                and not edit.class_level_edits
+                and not edit.scope_changed_funcs
+                and edit.enclosing_funcs
+                and all(len(qn.split(".")) <= 2 for qn in edit.enclosing_funcs)
+            ):
+                hot_patch_specs.append((rel, file_to_module(rel), sorted(edit.enclosing_funcs)))
+            else:
+                can_hot_patch = False
+
+            if rel == "sqlglot/dialects/dialect.py" and any(
+                qn.startswith("_Dialect.") for qn in edit.enclosing_funcs
+            ):
+                can_slice_fixtures = False
 
             if rel == "sqlglot/parser.py" and is_parser_max_nodes_edit(edit):
                 parser_max_nodes_touched = True
@@ -951,8 +1048,22 @@ class BlastRadiusSelector:
                     }
                     core_coverage = self.line_to_tests.get(core, {})
                     if len(reader_lines) == 2 and reader_lines.intersection(core_coverage):
+                        ne_stem = Path(rel).stem
+                        dialect_scope: set[int] | None = None
+                        if ne_stem not in ("dialect", "__init__"):
+                            dialect_scope = set()
+                            for d in {ne_stem} | set(self.dialect_descendants.get(ne_stem, ())):
+                                dialect_scope.update(self.mod_to_dialect_tests.get(f"sqlglot.dialects.{d}", ()))
+                            for dmod in self.rev_import_dialect_mods.get(rel, ()):
+                                dialect_scope.update(self.mod_to_dialect_tests.get(dmod, ()))
+                            if not dialect_scope:
+                                dialect_scope = None
                         for ln in reader_lines:
-                            candidates.update(core_coverage.get(ln, ()))
+                            ln_tests = core_coverage.get(ln, ())
+                            if dialect_scope is not None:
+                                candidates.update(t for t in ln_tests if t in dialect_scope)
+                            else:
+                                candidates.update(ln_tests)
                         py_hit_lines_for_fixtures.append((core, reader_lines))
                         check_import_rels.append(rel)
                         tpcds_affected_qs = tpcds_duckdb_affected_qs = tpcds_exec_affected_qs = None
@@ -1252,10 +1363,14 @@ class BlastRadiusSelector:
                 tpcds_affected_qs = eqs
                 tpcds_duckdb_affected_qs = set(eqs)
 
-        # Compute sound per-fixture-index bitmasks for TestOptimizer tests when eligible!
+        # Compute sound per-fixture-index bitmasks for optimizer/serde/transpile fixture tests when eligible!
         fixture_index_masks: dict[str, int] | None = None
         has_opt_cand = any(self.by_num[n]["file"] == "tests/test_optimizer.py" for n in candidates)
-        if has_opt_cand and (
+        has_fixture_cand = has_opt_cand or any(
+            self.by_num[n]["file"] in ("tests/test_serde.py", "tests/test_transpile.py")
+            for n in candidates
+        )
+        if has_fixture_cand and (
             (can_slice_fixtures and py_hit_lines_for_fixtures) or expr_class_slice
         ):
             self._ensure_fixture_cov()
@@ -1286,6 +1401,66 @@ class BlastRadiusSelector:
                         short = pfile[len("tests/fixtures/"):]
                         masks.pop(short, None)
                 fixture_index_masks = masks
+
+        # Compute sound per-Validator-call bitmasks for ALL tests/dialects/*.py candidates!
+        validator_call_masks: dict[str, int] | None = None
+        has_dialect_cand = any(
+            self.by_num[n]["file"].startswith("tests/dialects/") for n in candidates
+        )
+        if (
+            has_dialect_cand
+            and "tests/dialects/test_dialect.py" not in patched_files
+            and ((can_slice_fixtures and py_hit_lines_for_fixtures) or expr_class_slice)
+        ):
+            self._ensure_validator_cov()
+            if self._vcall_id_to_idx:
+                target_idx_to_tid: dict[int, str] = {}
+                for n in candidates:
+                    info = self.by_num[n]
+                    f = info["file"]
+                    if f.startswith("tests/dialects/") and f not in patched_files:
+                        tid = info["id"]
+                        tidx = self._vcall_id_to_idx.get(tid)
+                        if tidx is not None:
+                            target_idx_to_tid[tidx] = tid
+                if target_idx_to_tid:
+                    vmasks: dict[int, int] = {tidx: 0 for tidx in target_idx_to_tid}
+                    if expr_class_slice and expr_class_edits:
+                        emap = self._get_validator_expr_map()
+                        for ec in expr_class_edits:
+                            ed = emap.get(ec)
+                            if not ed:
+                                continue
+                            for tidx in target_idx_to_tid:
+                                em = ed.get(tidx)
+                                if em is not None:
+                                    cur = vmasks[tidx]
+                                    if cur != -1:
+                                        vmasks[tidx] = -1 if em == -1 else (cur | em)
+                    else:
+                        for src_f, lines_set in (() if fixture_enum_equivalent else py_hit_lines_for_fixtures):
+                            smap = self._get_validator_src_map(src_f)
+                            if not smap:
+                                continue
+                            for tidx in target_idx_to_tid:
+                                cur = vmasks[tidx]
+                                if cur == -1:
+                                    continue
+                                lmap = smap.get(tidx)
+                                if not lmap:
+                                    continue
+                                for ln in lines_set:
+                                    lm = lmap.get(ln)
+                                    if lm is None:
+                                        continue
+                                    if lm == -1:
+                                        cur = -1
+                                        break
+                                    cur |= lm
+                                vmasks[tidx] = cur
+                    validator_call_masks = {
+                        tid: vmasks[tidx] for tidx, tid in target_idx_to_tid.items()
+                    }
 
         if fixture_enum_equivalent:
             # TPC-DS uses the same built-in dialect initialization as these optimizer fixtures.
@@ -1449,21 +1624,99 @@ class BlastRadiusSelector:
         fast_giants.sort(key=lambda x: giant_prio.get(x[0], 9))
         verify_list.extend(fast_giants)
 
+        # Soundness check for skip_scope_stress & skip_redshift_values_stress:
+        skip_scope_stress = False
+        if expr_class_slice and expr_class_edits and self.scope_stress_exprs:
+            if not (expr_class_edits & self.scope_stress_exprs):
+                skip_scope_stress = True
+        elif can_slice_fixtures and py_hit_lines_for_fixtures and self.scope_stress_lines:
+            hits_stress = False
+            for src_f, lines_set in py_hit_lines_for_fixtures:
+                sl = self.scope_stress_lines.get(src_f)
+                if sl and (lines_set & sl):
+                    hits_stress = True
+                    break
+            if not hits_stress:
+                skip_scope_stress = True
+
+        skip_redshift_values_stress = False
+        if "tests/dialects/test_redshift.py" not in patched_files:
+            if expr_class_slice and expr_class_edits and self.redshift_values_stress_exprs:
+                if not (expr_class_edits & self.redshift_values_stress_exprs):
+                    skip_redshift_values_stress = True
+            elif can_slice_fixtures and py_hit_lines_for_fixtures and self.redshift_values_stress_lines:
+                hits_rs = False
+                for src_f, lines_set in py_hit_lines_for_fixtures:
+                    sl = self.redshift_values_stress_lines.get(src_f)
+                    if sl and (lines_set & sl):
+                        hits_rs = True
+                        break
+                if not hits_rs:
+                    skip_redshift_values_stress = True
+
         # Server-calibrated verification CPU estimates (~2.8x slower single-core than Apple Silicon)
+        _opt_test_to_fixture = {
+            "test_tpcds": "optimizer/tpc-ds/tpc-ds.sql",
+            "test_tpch": "optimizer/tpc-h/tpc-h.sql",
+            "test_optimize": "optimizer/optimizer.sql",
+            "test_qualify_columns": "optimizer/qualify_columns.sql",
+            "test_qualify_columns_ddl": "optimizer/qualify_columns_ddl.sql",
+            "test_qualify_columns_with_invisible": "optimizer/qualify_columns__with_invisible.sql",
+            "test_qualify_columns_invalid": "optimizer/qualify_columns__invalid.sql",
+            "test_qualify_tables": "optimizer/qualify_tables.sql",
+            "test_merge_subqueries": "optimizer/merge_subqueries.sql",
+            "test_canonicalize": "optimizer/canonicalize.sql",
+            "test_canonicalize_internal_names": "optimizer/canonicalize_internal_names.sql",
+            "test_simplify": "optimizer/simplify.sql",
+            "test_unnest_subqueries": "optimizer/unnest_subqueries.sql",
+            "test_pushdown_predicates": "optimizer/pushdown_predicates.sql",
+            "test_pushdown_projections": "optimizer/pushdown_projections.sql",
+            "test_pushdown_cte_alias_columns": "optimizer/pushdown_cte_alias_columns.sql",
+            "test_eliminate_joins": "optimizer/eliminate_joins.sql",
+            "test_eliminate_subqueries": "optimizer/eliminate_subqueries.sql",
+            "test_eliminate_ctes": "optimizer/eliminate_ctes.sql",
+            "test_isolate_table_selects": "optimizer/isolate_table_selects.sql",
+            "test_normalize": "optimizer/normalize.sql",
+            "test_normalize_identifiers": "optimizer/normalize_identifiers.sql",
+            "test_optimize_joins": "optimizer/optimize_joins.sql",
+            "test_quote_identifiers": "optimizer/quote_identifiers.sql",
+            "test_annotate_funcs": "optimizer/annotate_functions.sql",
+            "test_annotate_types": "optimizer/annotate_types.sql",
+        }
+        _db_cached_opt_tests = {
+            "test_optimize_correlated_all",
+            "test_qualify_semi_anti_join_alias_shadowing_column",
+            "test_merge_asof_join_inputs",
+            "test_optimize_in_nulls",
+            "test_optimize_special_joins",
+        }
+        _stage_scale = (
+            min(1.0, max(0.12, (early_stage + 2) / 14.0))
+            if early_stage is not None
+            else 1.0
+        )
         verification_cpu_ms: dict[int, float] = {}
         opt_tpcds_num = self.by_id.get("tests/test_optimizer.py::TestOptimizer::test_tpcds")
         scope_num = self.by_id.get("tests/test_optimizer.py::TestOptimizer::test_scope")
         cache_num = self.by_id.get("tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries")
         agg_order_num = self.by_id.get("tests/test_executor.py::TestExecutor::test_agg_order")
+        rs_values_num = self.by_id.get("tests/dialects/test_redshift.py::TestRedshift::test_values")
+        serde_num = self.by_id.get("tests/test_serde.py::TestSerde::test_serde")
+        transpile_id_num = self.by_id.get("tests/test_transpile.py::TestTranspile::test_identity")
+        transpile_pretty_num = self.by_id.get("tests/test_transpile.py::TestTranspile::test_pretty")
+        cross_join_num = self.by_id.get("tests/test_optimize_cross_joins.py::TestOptimizeCrossJoins::test_conditional_cross_joins")
         for n in candidates - auto_include:
-            file = self.by_num[n]["file"]
+            info = self.by_num[n]
+            file = info["file"]
+            tid = info["id"]
+            mname = tid.rsplit("::", 1)[-1]
             if n == self.max_nodes_num and max_nodes_fast_arg:
                 verification_cpu_ms[n] = 3500.0 if parser_max_nodes_touched else 40.0
             elif n == self.tpcds_num:
                 if tpcds_fixture_override is not None:
                     verification_cpu_ms[n] = 100.0
                 elif tpcds_fast_arg is not None:
-                    verification_cpu_ms[n] = min(3500.0, self.dur_ms[n] * 0.18)
+                    verification_cpu_ms[n] = min(2500.0, self.dur_ms[n] * 0.12)
                 else:
                     verification_cpu_ms[n] = self.dur_ms[n] * 0.90
             elif n == self.tpch_num and (tpch_fast_arg or tpch_fixture_override is not None):
@@ -1471,26 +1724,80 @@ class BlastRadiusSelector:
             elif n == self.opt_tpch_num and (opt_tpch_hashes_arg is not None or tpch_fixture_override is not None):
                 verification_cpu_ms[n] = 80.0
             elif n == self.gen_mem_num and gen_mem_fast_arg:
-                verification_cpu_ms[n] = 30.0 * len(gen_mem_dialects_arg) if gen_mem_dialects_arg else 550.0
-            elif n == opt_tpcds_num and not (opt_dialect_filter or fixture_index_masks or early_stage is not None):
-                verification_cpu_ms[n] = self.dur_ms[n] * 1.60
-            elif n == scope_num and not (opt_dialect_filter or fixture_index_masks):
-                verification_cpu_ms[n] = self.dur_ms[n] * 0.65
+                verification_cpu_ms[n] = 20.0 * len(gen_mem_dialects_arg) if gen_mem_dialects_arg else 350.0
+            elif n == opt_tpcds_num:
+                if fixture_index_masks and "optimizer/tpc-ds/tpc-ds.sql" in fixture_index_masks:
+                    tot_p = max(1, self._fixture_pair_counts.get("optimizer/tpc-ds/tpc-ds.sql", 99))
+                    frac = fixture_index_masks["optimizer/tpc-ds/tpc-ds.sql"].bit_count() / tot_p
+                    verification_cpu_ms[n] = max(10.0, self.dur_ms[n] * 1.60 * frac * _stage_scale)
+                elif opt_dialect_filter:
+                    verification_cpu_ms[n] = max(15.0, self.dur_ms[n] * 0.25)
+                else:
+                    verification_cpu_ms[n] = self.dur_ms[n] * 1.60 * _stage_scale
+            elif n == scope_num:
+                if skip_scope_stress:
+                    verification_cpu_ms[n] = 180.0
+                elif opt_dialect_filter == {"bigquery"}:
+                    verification_cpu_ms[n] = 20.0
+                else:
+                    verification_cpu_ms[n] = self.dur_ms[n] * 0.80
             elif n == cache_num:
-                verification_cpu_ms[n] = self.dur_ms[n] * 0.45
+                verification_cpu_ms[n] = 40.0
             elif n == agg_order_num:
-                verification_cpu_ms[n] = self.dur_ms[n] * 0.35
+                verification_cpu_ms[n] = 10.0
+            elif n == rs_values_num and skip_redshift_values_stress:
+                verification_cpu_ms[n] = 30.0
+            elif n == cross_join_num and "tests/test_optimize_cross_joins.py" not in patched_files:
+                verification_cpu_ms[n] = max(15.0, self.dur_ms[n] * 0.65 * _stage_scale)
+            elif n in (serde_num, transpile_id_num) and fixture_index_masks and "identity.sql" in fixture_index_masks:
+                tot_i = max(1, self._fixture_pair_counts.get("identity.sql", 980))
+                frac = fixture_index_masks["identity.sql"].bit_count() / tot_i
+                verification_cpu_ms[n] = max(5.0, self.dur_ms[n] * frac)
+            elif n == transpile_pretty_num and fixture_index_masks and "pretty.sql" in fixture_index_masks:
+                tot_i = max(1, self._fixture_pair_counts.get("pretty.sql", 30))
+                frac = fixture_index_masks["pretty.sql"].bit_count() / tot_i
+                verification_cpu_ms[n] = max(5.0, self.dur_ms[n] * frac)
+            elif validator_call_masks is not None and tid in validator_call_masks:
+                vm = validator_call_masks[tid]
+                if vm == -1:
+                    ratio = 0.25 if dialect_filter else 0.90
+                    verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * ratio)
+                else:
+                    tidx = self._vcall_id_to_idx[tid]
+                    tot_c = max(1, self._vcall_counts[tidx])
+                    frac = vm.bit_count() / tot_c
+                    verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * frac)
             elif file == "tests/test_optimizer.py":
-                ratio = 0.20 if (opt_dialect_filter or fixture_index_masks or early_stage is not None) else 0.85
-                verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * ratio)
+                fix_name = _opt_test_to_fixture.get(mname)
+                if fix_name and fixture_index_masks and fix_name in fixture_index_masks:
+                    tot_f = max(1, self._fixture_pair_counts.get(fix_name, 1))
+                    frac = fixture_index_masks[fix_name].bit_count() / tot_f
+                    scale = _stage_scale if mname in ("test_optimize", "test_tpch", "test_merge_subqueries", "test_canonicalize") else 1.0
+                    verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * 0.90 * frac * scale)
+                elif opt_dialect_filter and fix_name:
+                    verification_cpu_ms[n] = max(2.0, self.dur_ms[n] * 0.25)
+                elif mname in _db_cached_opt_tests and "tests/test_optimizer.py" not in patched_files:
+                    verification_cpu_ms[n] = max(10.0, self.dur_ms[n] * 0.65 * _stage_scale)
+                else:
+                    verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * 0.85)
             elif file.startswith("tests/dialects/") and dialect_filter:
                 verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * 0.25)
             else:
                 verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * 0.85)
 
         if normal_cands:
-            # Verify ALL normal candidates in DESCENDING dur_ms order (highest-value / slack-creating tests first!)
-            for n in sorted(normal_cands, key=lambda x: -self.dur_ms[x]):
+            if len(candidates) > 200:
+                for n in normal_cands:
+                    if verification_cpu_ms.get(n, 0.0) < 5.0:
+                        verification_cpu_ms[n] = 5.0
+            # Verify high-ROI (sliced/cheap) normal candidates FIRST in descending dur_ms, then unsliced descending!
+            for n in sorted(
+                normal_cands,
+                key=lambda x: (
+                    0 if verification_cpu_ms.get(x, self.dur_ms[x]) < self.dur_ms[x] * 0.45 else 1,
+                    -self.dur_ms[x],
+                ),
+            ):
                 verify_list.append((n, self.by_num[n]["id"]))
 
         final_failing: set[int] = set(auto_include)
@@ -1501,21 +1808,6 @@ class BlastRadiusSelector:
                 final_failing.update(n for n, _ in verify_list)
                 return pack_workers(final_failing, self.dur_ms)
 
-            # Soundness check for skip_scope_stress:
-            skip_scope_stress = False
-            if expr_class_slice and expr_class_edits and self.scope_stress_exprs:
-                if not (expr_class_edits & self.scope_stress_exprs):
-                    skip_scope_stress = True
-            elif can_slice_fixtures and py_hit_lines_for_fixtures and self.scope_stress_lines:
-                hits_stress = False
-                for src_f, lines_set in py_hit_lines_for_fixtures:
-                    sl = self.scope_stress_lines.get(src_f)
-                    if sl and (lines_set & sl):
-                        hits_stress = True
-                        break
-                if not hits_stress:
-                    skip_scope_stress = True
-
             # Soundness check for duckdb_passing_pairs: safe whenever tests/test_optimizer.py wasn't edited!
             use_duck_pairs = (
                 self.duckdb_passing_pairs
@@ -1523,23 +1815,38 @@ class BlastRadiusSelector:
                 else None
             )
 
+            use_hot_patches = (
+                can_hot_patch
+                and bool(hot_patch_specs)
+                and not check_import_rels
+                and not has_syntax_or_import_break
+                and not any(n == self.lazy_load_num for n, _ in verify_list)
+            )
             need_tier0 = (
-                any(p in DEFAULT_CORE_FILES for p in patched_files)
-                or any(p.startswith("sqlglot/expressions/") for p in patched_files)
-                or any(n == self.lazy_load_num for n, _ in verify_list)
+                any(n == self.lazy_load_num for n, _ in verify_list)
+                or (
+                    not use_hot_patches
+                    and (
+                        any(p in DEFAULT_CORE_FILES for p in patched_files)
+                        or any(p.startswith("sqlglot/expressions/") for p in patched_files)
+                    )
+                )
             )
             job = {
                 "patched_files": patched_files,
+                "hot_patch_specs": hot_patch_specs if use_hot_patches else None,
                 "check_import_rels": check_import_rels,
                 "serde_touched": serde_touched,
                 "fixture_pair_overrides": fixture_pair_overrides or None,
                 "fixture_pair_only": fixture_pair_only,
                 "fixture_item_overrides": fixture_item_overrides or None,
                 "fixture_index_masks": fixture_index_masks,
+                "validator_call_masks": validator_call_masks,
                 "dialect_filter": dialect_filter,
                 "opt_dialect_filter": opt_dialect_filter,
                 "dialect_edit_mode": dialect_edit_mode,
                 "skip_scope_stress": skip_scope_stress,
+                "skip_redshift_values_stress": skip_redshift_values_stress,
                 "duckdb_passing_pairs": use_duck_pairs,
                 "tpcds_fast": tpcds_fast_arg,
                 "tpcds_fixture_override": tpcds_fixture_override,

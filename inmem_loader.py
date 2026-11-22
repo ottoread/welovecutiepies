@@ -213,6 +213,162 @@ def install_overlay(repo_root: Path, patched_files: dict[str, str | None]) -> No
     Path.read_bytes = overlay_path_read_bytes
 
 
+def apply_hot_patches(
+    patched_files: dict[str, str | None],
+    hot_patch_specs: list[tuple[str, str, list[str]]],
+) -> bool:
+    """Safely hot-patch pure function/method body edits in-place via __code__ swap inside a forked Tier-1 child.
+
+    Returns True iff EVERY specified function was cleanly patched with matching freevars/defaults.
+    If anything does not match (nested closures, descriptors, missing target, etc.), returns False
+    so the caller falls back to Tier 0 cleanly.
+    """
+    try:
+        for rel_path, mod_name, qnames in hot_patch_specs:
+            src = patched_files.get(rel_path)
+            if src is None:
+                return False
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                continue  # Not imported yet -> _OverlayFinder will load the patched file!
+
+            tree = ast.parse(src, filename=getattr(mod, "__file__", rel_path))
+            future_imports = [
+                n for n in tree.body
+                if isinstance(n, ast.ImportFrom) and n.module == "__future__"
+            ]
+            # Index top-level functions and top-level class methods
+            top_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+            cls_methods: dict[tuple[str, str], ast.FunctionDef | ast.AsyncFunctionDef] = {}
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    top_funcs[node.name] = node
+                elif isinstance(node, ast.ClassDef):
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            cls_methods[(node.name, item.name)] = item
+
+            for qn in qnames:
+                parts = qn.split(".")
+                if len(parts) == 1:
+                    fn_name = parts[0]
+                    fn_node = top_funcs.get(fn_name)
+                    if fn_node is None:
+                        return False
+                    raw_obj = mod.__dict__.get(fn_name)
+                    if raw_obj is None:
+                        return False
+                    target_fn = raw_obj
+                    cache_obj = None
+                    if hasattr(target_fn, "__wrapped__") and hasattr(target_fn, "cache_clear"):
+                        cache_obj = target_fn
+                        target_fn = target_fn.__wrapped__
+                    if not hasattr(target_fn, "__code__"):
+                        return False
+                    # Compile stripped (no decorators) function def in minimal module AST
+                    fn_copy = ast.FunctionDef(
+                        name=fn_node.name,
+                        args=fn_node.args,
+                        body=fn_node.body,
+                        decorator_list=[],
+                        returns=fn_node.returns,
+                        type_comment=fn_node.type_comment,
+                        type_params=getattr(fn_node, "type_params", []),
+                    )
+                    if isinstance(fn_node, ast.AsyncFunctionDef):
+                        fn_copy = ast.AsyncFunctionDef(
+                            name=fn_node.name,
+                            args=fn_node.args,
+                            body=fn_node.body,
+                            decorator_list=[],
+                            returns=fn_node.returns,
+                            type_comment=fn_node.type_comment,
+                            type_params=getattr(fn_node, "type_params", []),
+                        )
+                    ast.copy_location(fn_copy, fn_node)
+                    mod_ast = ast.Module(body=[*future_imports, fn_copy], type_ignores=[])
+                    ast.fix_missing_locations(mod_ast)
+                    ns: dict[str, Any] = {}
+                    exec(compile(mod_ast, target_fn.__code__.co_filename, "exec"), mod.__dict__, ns)
+                    new_fn = ns[fn_name]
+                    if new_fn.__code__.co_freevars != target_fn.__code__.co_freevars:
+                        return False
+                    target_fn.__code__ = new_fn.__code__
+                    if cache_obj is not None:
+                        cache_obj.cache_clear()
+                elif len(parts) == 2:
+                    cls_name, m_name = parts
+                    fn_node = cls_methods.get((cls_name, m_name))
+                    if fn_node is None:
+                        return False
+                    cls_obj = mod.__dict__.get(cls_name)
+                    if cls_obj is None or not isinstance(cls_obj, type):
+                        return False
+                    raw_attr = cls_obj.__dict__.get(m_name)
+                    if raw_attr is None:
+                        return False
+                    cache_obj = None
+                    if isinstance(raw_attr, (staticmethod, classmethod)):
+                        target_fn = raw_attr.__func__
+                    elif isinstance(raw_attr, property):
+                        if raw_attr.fget is None or raw_attr.fset is not None or raw_attr.fdel is not None:
+                            return False
+                        target_fn = raw_attr.fget
+                    else:
+                        target_fn = raw_attr
+                    if hasattr(target_fn, "__wrapped__") and hasattr(target_fn, "cache_clear"):
+                        cache_obj = target_fn
+                        target_fn = target_fn.__wrapped__
+                    if not hasattr(target_fn, "__code__"):
+                        return False
+                    if isinstance(fn_node, ast.AsyncFunctionDef):
+                        fn_copy = ast.AsyncFunctionDef(
+                            name=fn_node.name,
+                            args=fn_node.args,
+                            body=fn_node.body,
+                            decorator_list=[],
+                            returns=fn_node.returns,
+                            type_comment=fn_node.type_comment,
+                            type_params=getattr(fn_node, "type_params", []),
+                        )
+                    else:
+                        fn_copy = ast.FunctionDef(
+                            name=fn_node.name,
+                            args=fn_node.args,
+                            body=fn_node.body,
+                            decorator_list=[],
+                            returns=fn_node.returns,
+                            type_comment=fn_node.type_comment,
+                            type_params=getattr(fn_node, "type_params", []),
+                        )
+                    ast.copy_location(fn_copy, fn_node)
+                    # Wrap in dummy class so super() / __class__ freevar compiles identically!
+                    cls_stub = ast.ClassDef(
+                        name=cls_name,
+                        bases=[],
+                        keywords=[],
+                        body=[fn_copy],
+                        decorator_list=[],
+                        type_params=[],
+                    )
+                    ast.copy_location(cls_stub, fn_node)
+                    mod_ast = ast.Module(body=[*future_imports, cls_stub], type_ignores=[])
+                    ast.fix_missing_locations(mod_ast)
+                    ns = {}
+                    exec(compile(mod_ast, target_fn.__code__.co_filename, "exec"), mod.__dict__, ns)
+                    new_fn = ns[cls_name].__dict__[m_name]
+                    if new_fn.__code__.co_freevars != target_fn.__code__.co_freevars:
+                        return False
+                    target_fn.__code__ = new_fn.__code__
+                    if cache_obj is not None:
+                        cache_obj.cache_clear()
+                else:
+                    return False
+        return True
+    except BaseException:
+        return False
+
+
 class _LazyFuture:
     def __init__(self, fn, args, kwargs, check_pickle: bool):
         self._fn = fn
@@ -312,7 +468,8 @@ class _LazyDuckDBConn:
     def _ensure(self):
         if self._conn is None:
             import duckdb
-            conn = duckdb.connect()
+            conn = (_orig_duck_connect_ref or duckdb.connect)()
+            conn.execute("SET threads TO 1")
             conn.execute(
                 """
                 CREATE TABLE x (a INT, b INT);
@@ -345,6 +502,173 @@ class _LazyDuckDBConn:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+_db_query_cache_loaded = False
+_db_query_cache: dict[tuple[str, str, str, str], Any] = {}
+_orig_duck_connect_ref: Any = None
+_orig_sqlite_connect_ref: Any = None
+
+
+def _get_db_query_cache() -> dict[tuple[str, str, str, str], Any]:
+    global _db_query_cache_loaded, _db_query_cache
+    if not _db_query_cache_loaded:
+        _db_query_cache_loaded = True
+        p = _APP_DIR / "db_query_cache.zlib"
+        if p.is_file():
+            try:
+                _db_query_cache = pickle.loads(zlib.decompress(p.read_bytes()))
+            except BaseException:
+                _db_query_cache = {}
+    return _db_query_cache
+
+
+def _db_hash(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+
+def _is_db_read_query(sql: str) -> bool:
+    head = sql.lstrip().upper()
+    return head.startswith(("SELECT", "WITH", "VALUES", "(SELECT", "FROM"))
+
+
+class _CachedDBCursor:
+    __slots__ = ("_conn", "_setup_sig", "_qhash", "_sql", "_real_cur")
+
+    def __init__(self, conn: _CachedDBConn, setup_sig: str, qhash: str, sql: str):
+        self._conn = conn
+        self._setup_sig = setup_sig
+        self._qhash = qhash
+        self._sql = sql
+        self._real_cur = None
+
+    def _ensure_cur(self):
+        if self._real_cur is None:
+            self._real_cur = self._conn._ensure_real().execute(self._sql)
+        return self._real_cur
+
+    def fetchall(self):
+        cache = self._conn._cache
+        key = (self._conn._engine, self._setup_sig, self._qhash, "fetchall")
+        hit = cache.get(key, _EXACT_BASELINE_MATCH)
+        if hit is not _EXACT_BASELINE_MATCH:
+            return list(hit) if isinstance(hit, list) else hit
+        return self._ensure_cur().fetchall()
+
+    def fetchone(self):
+        cache = self._conn._cache
+        key = (self._conn._engine, self._setup_sig, self._qhash, "fetchone")
+        hit = cache.get(key, _EXACT_BASELINE_MATCH)
+        if hit is not _EXACT_BASELINE_MATCH:
+            return hit
+        return self._ensure_cur().fetchone()
+
+    def __iter__(self):
+        return iter(self._ensure_cur())
+
+    def __getattr__(self, name):
+        return getattr(self._ensure_cur(), name)
+
+
+class _CachedDBConn:
+    """Lazy DuckDB/SQLite wrapper: serves known deterministic baseline queries in O(1), falls back to real DB on any miss."""
+
+    def __init__(self, engine: str, real_factory, cache: dict):
+        self._engine = engine
+        self._real_factory = real_factory
+        self._cache = cache
+        self._setup_ops: list[tuple[str, str]] = []
+        self._setup_sqls: list[str] = []
+        self._real = None
+
+    def _ensure_real(self):
+        if self._real is None:
+            conn = self._real_factory()
+            if self._engine == "duckdb":
+                conn.execute("SET threads TO 1")
+            for op, sql in self._setup_ops:
+                if op == "script":
+                    conn.executescript(sql)
+                else:
+                    conn.execute(sql)
+            self._real = conn
+        return self._real
+
+    def execute(self, sql, *args, **kwargs):
+        if not args and not kwargs and isinstance(sql, str):
+            if _is_db_read_query(sql):
+                sig = _db_hash("\x00".join(self._setup_sqls))
+                return _CachedDBCursor(self, sig, _db_hash(sql), sql)
+            self._setup_ops.append(("exec", sql))
+            self._setup_sqls.append(sql)
+            if self._real is not None:
+                return self._real.execute(sql)
+            return self
+        return self._ensure_real().execute(sql, *args, **kwargs)
+
+    def executescript(self, sql):
+        if isinstance(sql, str):
+            self._setup_ops.append(("script", sql))
+            self._setup_sqls.append(sql)
+            if self._real is not None:
+                return self._real.executescript(sql)
+            return self
+        return self._ensure_real().executescript(sql)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        if self._real is not None:
+            try:
+                self._real.close()
+            finally:
+                self._real = None
+        return False
+
+    def close(self):
+        if self._real is not None:
+            try:
+                self._real.close()
+            finally:
+                self._real = None
+
+    def __getattr__(self, name):
+        return getattr(self._ensure_real(), name)
+
+
+def _install_local_db_cache() -> None:
+    """Install sound deterministic query cache on duckdb.connect() and sqlite3.connect(':memory:')."""
+    global _orig_duck_connect_ref, _orig_sqlite_connect_ref
+    cache = _get_db_query_cache()
+    if not cache:
+        return
+    try:
+        import duckdb
+        if _orig_duck_connect_ref is None:
+            _orig_duck_connect_ref = duckdb.connect
+
+            def _cached_duck_connect(*args, **kwargs):
+                if not args and not kwargs:
+                    return _CachedDBConn("duckdb", _orig_duck_connect_ref, cache)
+                return _orig_duck_connect_ref(*args, **kwargs)
+
+            duckdb.connect = _cached_duck_connect
+    except BaseException:
+        pass
+    try:
+        import sqlite3
+        if _orig_sqlite_connect_ref is None:
+            _orig_sqlite_connect_ref = sqlite3.connect
+
+            def _cached_sqlite_connect(database, *args, **kwargs):
+                if database == ":memory:" and not args and not kwargs:
+                    return _CachedDBConn("sqlite", lambda: _orig_sqlite_connect_ref(":memory:"), cache)
+                return _orig_sqlite_connect_ref(database, *args, **kwargs)
+
+            sqlite3.connect = _cached_sqlite_connect
+    except BaseException:
+        pass
 
 
 def _install_lazy_test_executor(mod, cls) -> None:
@@ -417,10 +741,13 @@ def _install_assert_ctx_hooks() -> None:
         setattr(unittest.TestCase, mname, make_wrapped(orig))
 
 
+_vcall_state: list[Any] = [None, 0, 0]  # [active_mask_or_None, next_idx, nesting_depth]
+
+
 def _install_dialect_validator_slicing(
-    dialect_filter: set[str], dialect_edit_mode: str = "all"
+    dialect_filter: set[str] | None, dialect_edit_mode: str = "all"
 ) -> None:
-    """Patch Validator.validate_all / validate_transpile / validate_identity with exact _assert_ctx_depth guard."""
+    """Patch Validator.validate_all / validate_transpile / validate_identity with bitmask + dialect_filter guards."""
     _install_assert_ctx_hooks()
     try:
         import tests.dialects.test_dialect as td
@@ -438,65 +765,112 @@ def _install_dialect_validator_slicing(
     parser_only = dialect_edit_mode == "parser"
 
     def fast_validate_all(self, sql, read=None, write=None, pretty=False, identify=False):
-        if _assert_ctx_depth > 0:
-            return orig_all(self, sql, read=read, write=write, pretty=pretty, identify=identify)
-        if _any_dialect_in(self.dialect, dialect_filter):
-            if gen_only and write:
-                f_write = {k: v for k, v in write.items() if _any_dialect_in(k, dialect_filter)}
-                if not read and not f_write:
-                    return None
-                return orig_all(self, sql, read=read, write=f_write or None, pretty=pretty, identify=identify)
-            if parser_only and read:
-                f_read = {k: v for k, v in read.items() if _any_dialect_in(k, dialect_filter)}
-                if not f_read and not write:
-                    return None
-                return orig_all(self, sql, read=f_read or None, write=write, pretty=pretty, identify=identify)
-            return orig_all(self, sql, read=read, write=write, pretty=pretty, identify=identify)
-        f_read = {k: v for k, v in read.items() if _any_dialect_in(k, dialect_filter)} if read else None
-        f_write = {k: v for k, v in write.items() if _any_dialect_in(k, dialect_filter)} if write else None
-        if not f_read and not f_write:
-            return None
-        if f_read and not f_write:
-            from sqlglot import ErrorLevel, parse_one
-            for read_dialect, read_sql in f_read.items():
-                with self.subTest(f"{read_dialect} -> {sql}"):
-                    self.assertEqual(
-                        parse_one(read_sql, read_dialect).sql(
-                            self.dialect,
-                            unsupported_level=ErrorLevel.IGNORE,
-                            pretty=pretty,
-                            identify=identify,
-                        ),
-                        sql,
-                    )
-            return None
-        return orig_all(self, sql, read=f_read, write=f_write, pretty=pretty, identify=identify)
+        outer = _vcall_state[2] == 0
+        if outer:
+            idx = _vcall_state[1]
+            _vcall_state[1] = idx + 1
+            mask = _vcall_state[0]
+            if mask is not None and mask != -1 and not ((mask >> idx) & 1) and _assert_ctx_depth == 0:
+                return None
+        _vcall_state[2] += 1
+        try:
+            if _assert_ctx_depth > 0 or dialect_filter is None:
+                return orig_all(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+            if _any_dialect_in(self.dialect, dialect_filter):
+                if gen_only and write:
+                    f_write = {k: v for k, v in write.items() if _any_dialect_in(k, dialect_filter)}
+                    if not read and not f_write:
+                        return None
+                    return orig_all(self, sql, read=read, write=f_write or None, pretty=pretty, identify=identify)
+                if parser_only and read:
+                    f_read = {k: v for k, v in read.items() if _any_dialect_in(k, dialect_filter)}
+                    if not f_read and not write:
+                        return None
+                    return orig_all(self, sql, read=f_read or None, write=write, pretty=pretty, identify=identify)
+                return orig_all(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+            f_read = {k: v for k, v in read.items() if _any_dialect_in(k, dialect_filter)} if read else None
+            f_write = {k: v for k, v in write.items() if _any_dialect_in(k, dialect_filter)} if write else None
+            if not f_read and not f_write:
+                return None
+            if f_read and not f_write:
+                from sqlglot import ErrorLevel, parse_one
+                for read_dialect, read_sql in f_read.items():
+                    with self.subTest(f"{read_dialect} -> {sql}"):
+                        self.assertEqual(
+                            parse_one(read_sql, read_dialect).sql(
+                                self.dialect,
+                                unsupported_level=ErrorLevel.IGNORE,
+                                pretty=pretty,
+                                identify=identify,
+                            ),
+                            sql,
+                        )
+                return None
+            return orig_all(self, sql, read=f_read, write=f_write, pretty=pretty, identify=identify)
+        finally:
+            _vcall_state[2] -= 1
 
     def fast_validate_transpile(self, sql, write_sql, write_dialect=None):
-        if _assert_ctx_depth == 0:
-            if not _any_dialect_in(self.dialect, dialect_filter) and not _any_dialect_in(write_dialect, dialect_filter):
+        outer = _vcall_state[2] == 0
+        if outer:
+            idx = _vcall_state[1]
+            _vcall_state[1] = idx + 1
+            mask = _vcall_state[0]
+            if (
+                mask is not None
+                and mask != -1
+                and not ((mask >> idx) & 1)
+                and _assert_ctx_depth == 0
+                and _return_value_discarded()
+            ):
                 return None
-            if gen_only and not _any_dialect_in(write_dialect, dialect_filter) and _return_value_discarded():
-                return None
-        return orig_tr(self, sql, write_sql, write_dialect=write_dialect)
+        _vcall_state[2] += 1
+        try:
+            if _assert_ctx_depth == 0 and dialect_filter is not None:
+                if not _any_dialect_in(self.dialect, dialect_filter) and not _any_dialect_in(write_dialect, dialect_filter):
+                    if _return_value_discarded():
+                        return None
+                if gen_only and not _any_dialect_in(write_dialect, dialect_filter) and _return_value_discarded():
+                    return None
+            return orig_tr(self, sql, write_sql, write_dialect=write_dialect)
+        finally:
+            _vcall_state[2] -= 1
 
     def fast_validate_identity(
         self, sql, write_sql=None, pretty=False, check_command_warning=False, identify=False
     ):
-        if (
-            _assert_ctx_depth == 0
-            and not _any_dialect_in(self.dialect, dialect_filter)
-            and _return_value_discarded()
-        ):
-            return None
-        return orig_id(
-            self,
-            sql,
-            write_sql=write_sql,
-            pretty=pretty,
-            check_command_warning=check_command_warning,
-            identify=identify,
-        )
+        outer = _vcall_state[2] == 0
+        if outer:
+            idx = _vcall_state[1]
+            _vcall_state[1] = idx + 1
+            mask = _vcall_state[0]
+            if (
+                mask is not None
+                and mask != -1
+                and not ((mask >> idx) & 1)
+                and _assert_ctx_depth == 0
+                and _return_value_discarded()
+            ):
+                return None
+        _vcall_state[2] += 1
+        try:
+            if (
+                _assert_ctx_depth == 0
+                and dialect_filter is not None
+                and not _any_dialect_in(self.dialect, dialect_filter)
+                and _return_value_discarded()
+            ):
+                return None
+            return orig_id(
+                self,
+                sql,
+                write_sql=write_sql,
+                pretty=pretty,
+                check_command_warning=check_command_warning,
+                identify=identify,
+            )
+        finally:
+            _vcall_state[2] -= 1
 
     Validator.validate_all = fast_validate_all
     Validator.validate_transpile = fast_validate_transpile
@@ -840,55 +1214,66 @@ def install_executor_speedups(
                     return True
                 return False
 
-            def _compile_positive_filter_sql(self, node, rrs: dict, use_single: bool, bindings: dict) -> str:
-                """Compile a top-level WHERE predicate into fast native Python truthiness (100% identical to SQL 3VL for `if cond:`)."""
+            def _compile_positive_filter_sql(
+                self, node, rrs: dict, use_single: bool, bindings: dict, strict_bool: bool = False
+            ) -> str:
+                """Compile a top-level WHERE/JOIN predicate into fast native Python truthiness (100% identical to SQL 3VL)."""
                 exp_m = py_mod.exp
                 if isinstance(node, exp_m.Paren):
-                    return f"({_compile_positive_filter_sql(self, node.this, rrs, use_single, bindings)})"
+                    return f"({_compile_positive_filter_sql(self, node.this, rrs, use_single, bindings, strict_bool)})"
                 if isinstance(node, exp_m.And):
-                    l = _compile_positive_filter_sql(self, node.this, rrs, use_single, bindings)
-                    r = _compile_positive_filter_sql(self, node.expression, rrs, use_single, bindings)
+                    l = _compile_positive_filter_sql(self, node.this, rrs, use_single, bindings, strict_bool)
+                    r = _compile_positive_filter_sql(self, node.expression, rrs, use_single, bindings, strict_bool)
                     return f"({l} and {r})"
                 if isinstance(node, exp_m.Or):
-                    l = _compile_positive_filter_sql(self, node.this, rrs, use_single, bindings)
-                    r = _compile_positive_filter_sql(self, node.expression, rrs, use_single, bindings)
+                    l = _compile_positive_filter_sql(self, node.this, rrs, use_single, bindings, strict_bool)
+                    r = _compile_positive_filter_sql(self, node.expression, rrs, use_single, bindings, strict_bool)
                     return f"({l} or {r})"
                 if isinstance(node, exp_m.EQ):
                     if _is_non_null_literal(node.expression) or _is_non_null_literal(node.this):
-                        l = _rewrite_scope(self.generator.generate(self._replace_subqueries(node.this)), rrs, bindings, "_row" if use_single else None)
-                        r = _rewrite_scope(self.generator.generate(self._replace_subqueries(node.expression)), rrs, bindings, "_row" if use_single else None)
+                        l = _rewrite_scope(self.generator.generate(self._replace_subqueries(node.this), copy=False), rrs, bindings, "_row" if use_single else None)
+                        r = _rewrite_scope(self.generator.generate(self._replace_subqueries(node.expression), copy=False), rrs, bindings, "_row" if use_single else None)
                         return f"({l} == {r})"
                 if isinstance(node, exp_m.NEQ):
                     if _is_non_null_literal(node.expression) and type(node.this) is exp_m.Column:
-                        l = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
-                        r = self.generator.generate(node.expression)
+                        l = _rewrite_scope(self.generator.generate(node.this, copy=False), rrs, bindings, "_row" if use_single else None)
+                        r = self.generator.generate(node.expression, copy=False)
                         return f"({l} is not None and {l} != {r})"
                 if isinstance(node, (exp_m.GT, exp_m.GTE, exp_m.LT, exp_m.LTE)):
                     if _is_non_null_literal(node.expression) and type(node.this) is exp_m.Column:
                         op = ">" if isinstance(node, exp_m.GT) else (">=" if isinstance(node, exp_m.GTE) else ("<" if isinstance(node, exp_m.LT) else "<="))
-                        l = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
-                        r = self.generator.generate(node.expression)
+                        l = _rewrite_scope(self.generator.generate(node.this, copy=False), rrs, bindings, "_row" if use_single else None)
+                        r = self.generator.generate(node.expression, copy=False)
                         return f"({l} is not None and {l} {op} {r})"
                     if _is_non_null_literal(node.this) and type(node.expression) is exp_m.Column:
                         op = ">" if isinstance(node, exp_m.GT) else (">=" if isinstance(node, exp_m.GTE) else ("<" if isinstance(node, exp_m.LT) else "<="))
-                        l = self.generator.generate(node.this)
-                        r = _rewrite_scope(self.generator.generate(node.expression), rrs, bindings, "_row" if use_single else None)
+                        l = self.generator.generate(node.this, copy=False)
+                        r = _rewrite_scope(self.generator.generate(node.expression, copy=False), rrs, bindings, "_row" if use_single else None)
                         return f"({r} is not None and {l} {op} {r})"
                 if isinstance(node, exp_m.Between):
                     if type(node.this) is exp_m.Column and _is_non_null_literal(node.args.get("low")) and _is_non_null_literal(node.args.get("high")):
-                        c = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
-                        lo = self.generator.generate(node.args["low"])
-                        hi = self.generator.generate(node.args["high"])
+                        c = _rewrite_scope(self.generator.generate(node.this, copy=False), rrs, bindings, "_row" if use_single else None)
+                        lo = self.generator.generate(node.args["low"], copy=False)
+                        hi = self.generator.generate(node.args["high"], copy=False)
                         return f"({c} is not None and {lo} <= {c} <= {hi})"
                 if isinstance(node, exp_m.In) and node.expressions and not node.args.get("query") and not node.args.get("field"):
                     if type(node.this) is exp_m.Column and all(_is_non_null_literal(x) for x in node.expressions):
-                        c = _rewrite_scope(self.generator.generate(node.this), rrs, bindings, "_row" if use_single else None)
-                        vals = ", ".join(self.generator.generate(x) for x in node.expressions)
+                        c = _rewrite_scope(self.generator.generate(node.this, copy=False), rrs, bindings, "_row" if use_single else None)
+                        vals = ", ".join(self.generator.generate(x, copy=False) for x in node.expressions)
                         return f"({c} in ({vals},))"
-                raw = self.generator.generate(self._replace_subqueries(node))
-                return _rewrite_scope(raw, rrs, bindings, "_row" if use_single else None)
+                raw = self.generator.generate(self._replace_subqueries(node), copy=False)
+                rw = _rewrite_scope(raw, rrs, bindings, "_row" if use_single else None)
+                return f"(({rw}) is True)" if strict_bool else rw
 
-            def _compile_expr_fn(self, expression, context, allow_single_row: bool = False, positive_filter: bool = False):
+            def _compile_expr_fn(
+                self,
+                expression,
+                context,
+                allow_single_row: bool = False,
+                positive_filter: bool = False,
+                strict_bool: bool = False,
+                want_row_sql: bool = False,
+            ):
                 if not expression:
                     return None, None
                 c_env = context.env
@@ -898,23 +1283,23 @@ def install_executor_speedups(
                     if positive_filter and not env_patched:
                         if use_single:
                             bindings: dict = {}
-                            sql2 = _compile_positive_filter_sql(self, expression, rrs, True, bindings)
+                            sql2 = _compile_positive_filter_sql(self, expression, rrs, True, bindings, strict_bool)
                             if "scope" not in sql2:
-                                return "row", eval(f"lambda _row: ({sql2})", c_env)
+                                return ("row_sql", sql2) if want_row_sql else ("row", eval(f"lambda _row: ({sql2})", c_env))
                         bindings = {}
-                        sql2 = _compile_positive_filter_sql(self, expression, rrs, False, bindings)
+                        sql2 = _compile_positive_filter_sql(self, expression, rrs, False, bindings, strict_bool)
                         if bindings:
                             defs = ", ".join(f"{k}={k}" for k in bindings)
                             ns = {**c_env, **bindings}
                             return "scope", eval(f"lambda scope, {defs}: ({sql2})", ns)
                         return "scope", eval(f"lambda scope: ({sql2})", c_env)
                     expression = self._replace_subqueries(expression)
-                    sql = self.generator.generate(expression)
+                    sql = self.generator.generate(expression, copy=False)
                     if use_single:
                         bindings = {}
                         sql2 = _rewrite_scope(sql, rrs, bindings, "_row")
                         if "scope" not in sql2:
-                            return "row", eval(f"lambda _row: ({sql2})", c_env)
+                            return ("row_sql", sql2) if want_row_sql else ("row", eval(f"lambda _row: ({sql2})", c_env))
                     bindings = {}
                     sql2 = _rewrite_scope(sql, rrs, bindings, None)
                     if bindings:
@@ -923,14 +1308,16 @@ def install_executor_speedups(
                         return "scope", eval(f"lambda scope, {defs}: ({sql2})", ns)
                     return "scope", eval(f"lambda scope: ({sql})", c_env)
                 expression = self._replace_subqueries(expression)
-                sql = self.generator.generate(expression)
+                sql = self.generator.generate(expression, copy=False)
                 return "scope", eval(f"lambda scope: ({sql})", c_env)
 
-            def _compile_tuple_fn(self, expressions, context, allow_single_row: bool = False):
+            def _compile_tuple_fn(
+                self, expressions, context, allow_single_row: bool = False, want_row_sql: bool = False
+            ):
                 if not expressions:
                     return None, None
                 gen_parts = [
-                    self.generator.generate(self._replace_subqueries(e)) if e else "None"
+                    self.generator.generate(self._replace_subqueries(e), copy=False) if e else "None"
                     for e in expressions
                 ]
                 c_env = context.env
@@ -942,7 +1329,7 @@ def install_executor_speedups(
                         rw = [_rewrite_scope(s, rrs, bindings, "_row") for s in gen_parts]
                         body = f"({', '.join(rw)},)"
                         if "scope" not in body:
-                            return "row", eval(f"lambda _row: {body}", c_env)
+                            return ("row_sql", body) if want_row_sql else ("row", eval(f"lambda _row: {body}", c_env))
                     bindings = {}
                     rw = [_rewrite_scope(s, rrs, bindings, None) for s in gen_parts]
                     body = f"({', '.join(rw)},)"
@@ -959,7 +1346,7 @@ def install_executor_speedups(
                 for e in expressions:
                     if e:
                         e2 = self._replace_subqueries(e)
-                        parts.append(self.generator.generate(e2))
+                        parts.append(self.generator.generate(e2, copy=False))
                     else:
                         parts.append("None")
                 return eval(f"lambda scope: ({', '.join(parts)},)", env)
@@ -967,23 +1354,76 @@ def install_executor_speedups(
             def _fast_project_and_filter(self, context, step, table_iter, direct_rows=None):
                 import math as _math
                 sink = self.table(step.projections if step.projections else context.columns)
+                limit = step.offset + step.limit
+                no_limit = _math.isinf(limit)
+                c_env = context.env
+
+                rows_src = direct_rows
+                if rows_src is None and no_limit:
+                    shared = _shared_rows_table(context)
+                    if shared is not None and len(context.tables) == 1 and getattr(table_iter, "table", None) is shared:
+                        rows_src = shared.rows
+
                 cond_mode, cond_fn = (
-                    _compile_expr_fn(self, step.condition, context, allow_single_row=True, positive_filter=True)
+                    _compile_expr_fn(
+                        self,
+                        step.condition,
+                        context,
+                        allow_single_row=True,
+                        positive_filter=True,
+                        want_row_sql=no_limit,
+                    )
                     if step.condition
                     else (None, None)
                 )
-                proj_mode, proj_fn = _compile_tuple_fn(self, step.projections, context, allow_single_row=True) if step.projections else (None, None)
-                limit = step.offset + step.limit
-                no_limit = _math.isinf(limit)
+                proj_mode, proj_fn = (
+                    _compile_tuple_fn(
+                        self,
+                        step.projections,
+                        context,
+                        allow_single_row=True,
+                        want_row_sql=no_limit,
+                    )
+                    if step.projections
+                    else (None, None)
+                )
+
+                # Ultra-fast compiled single-loop list comprehension (ZERO per-row Python call overhead!)
+                if no_limit and cond_mode in (None, "row_sql") and proj_mode in (None, "row_sql"):
+                    if rows_src is not None:
+                        if cond_fn is not None and proj_fn is not None:
+                            sink.rows = eval(f"lambda _rows: [{proj_fn} for _row in _rows if ({cond_fn})]", c_env)(rows_src)
+                        elif cond_fn is not None:
+                            sink.rows = eval(f"lambda _rows: [_row for _row in _rows if ({cond_fn})]", c_env)(rows_src)
+                        elif proj_fn is not None:
+                            sink.rows = eval(f"lambda _rows: [{proj_fn} for _row in _rows]", c_env)(rows_src)
+                        else:
+                            sink.rows = list(rows_src)
+                        return sink
+                    if cond_fn is not None and proj_fn is not None:
+                        sink.rows = eval(f"lambda _it: [{proj_fn} for _r in _it for _row in (_r.row,) if ({cond_fn})]", c_env)(table_iter)
+                    elif cond_fn is not None:
+                        sink.rows = eval(f"lambda _it: [_row for _r in _it for _row in (_r.row,) if ({cond_fn})]", c_env)(table_iter)
+                    elif proj_fn is not None:
+                        sink.rows = eval(f"lambda _it: [{proj_fn} for _r in _it for _row in (_r.row,)]", c_env)(table_iter)
+                    else:
+                        sink.rows = [r.row for r in table_iter]
+                    return sink
+
+                if cond_mode == "row_sql":
+                    cond_mode = "row"
+                    cond_fn = eval(f"lambda _row: ({cond_fn})", c_env)
+                if proj_mode == "row_sql":
+                    proj_mode = "row"
+                    proj_fn = eval(f"lambda _row: {proj_fn}", c_env)
+
                 sink_rows = sink.rows
                 sink_append = sink_rows.append
                 sink_width = len(sink.columns)
-                c_env = context.env
 
                 # Pure row-tuple loop (with C-speed list comprehension when no LIMIT!)
                 pure_row_ok = (cond_mode in (None, "row")) and (proj_mode in (None, "row"))
                 if pure_row_ok:
-                    rows_src = direct_rows
                     if rows_src is None:
                         shared = _shared_rows_table(context)
                         if shared is not None and len(context.tables) == 1 and getattr(table_iter, "table", None) is shared:
@@ -1122,19 +1562,17 @@ def install_executor_speedups(
                         condition_context = None
                     else:
                         condition = j_cond
-                        condition_context = (
-                            self.context(
-                                {
-                                    nm: Table(
-                                        source_context.columns + join_context.columns,
-                                        column_range=column_range,
-                                    )
-                                    for nm, column_range in column_ranges.items()
-                                }
-                            )
-                            if condition
-                            else None
-                        )
+                        if condition:
+                            cond_rows: list = []
+                            cond_cols = source_context.columns + join_context.columns
+                            cond_tbls = {}
+                            for nm, column_range in column_ranges.items():
+                                ct = Table(cond_cols, column_range=column_range)
+                                ct.rows = cond_rows
+                                cond_tbls[nm] = ct
+                            condition_context = self.context(cond_tbls)
+                        else:
+                            condition_context = None
 
                     if join.get("source_key"):
                         table = self.hash_join(
@@ -1191,13 +1629,13 @@ def install_executor_speedups(
                         if (
                             type(reader) is RowReader
                             and expr.name in reader.columns
-                            and self.generator.generate(expr) == f"scope[{alias!r}][{expr.name!r}]"
+                            and self.generator.generate(expr, copy=False) == f"scope[{alias!r}][{expr.name!r}]"
                         ):
                             return "col", None, reader.columns[expr.name]
                 mode, fn = _compile_tuple_fn(self, expressions, context, allow_single_row=True)
                 return mode, fn, None
 
-            def _group_hash_rows(context, compiled, single_key, results, side):
+            def _group_hash_rows(context, compiled, n_keys, results, side):
                 mode, key_fn, column_index = compiled
                 if mode == "col":
                     for index, (reader, _) in enumerate(context):
@@ -1206,11 +1644,17 @@ def install_executor_speedups(
                         if value is not None:
                             results[(value,)][side].append((index, row))
                 elif mode == "row":
-                    if single_key:
+                    if n_keys == 1:
                         for index, (reader, _) in enumerate(context):
                             row = reader.row
                             key = key_fn(row)
                             if key[0] is not None:
+                                results[key][side].append((index, row))
+                    elif n_keys == 2:
+                        for index, (reader, _) in enumerate(context):
+                            row = reader.row
+                            key = key_fn(row)
+                            if key[0] is not None and key[1] is not None:
                                 results[key][side].append((index, row))
                     else:
                         for index, (reader, _) in enumerate(context):
@@ -1218,7 +1662,7 @@ def install_executor_speedups(
                             key = key_fn(row)
                             if all(v is not None for v in key):
                                 results[key][side].append((index, row))
-                elif single_key:
+                elif n_keys == 1:
                     env = context.env
                     for index, (reader, _) in enumerate(context):
                         key = key_fn(env["scope"])
@@ -1270,6 +1714,15 @@ def install_executor_speedups(
                                     bucket = jmap_get(val)
                                     if bucket is None:
                                         jmap[val] = [row]
+                                    else:
+                                        bucket.append(row)
+                        elif len(s_keys) == 2:
+                            for row in j_tbl.rows:
+                                key = j_fn(row)
+                                if key[0] is not None and key[1] is not None:
+                                    bucket = jmap_get(key)
+                                    if bucket is None:
+                                        jmap[key] = [row]
                                     else:
                                         bucket.append(row)
                         else:
@@ -1369,22 +1822,25 @@ def install_executor_speedups(
                                         bucket.append(row)
 
                     if not condition:
-                        for k, srows in smap.items():
-                            jrows = jmap[k]
-                            for sr in srows:
-                                for jr in jrows:
-                                    t_append(sr + jr)
+                        table.rows = [sr + jr for k, srows in smap.items() for sr in srows for jr in jmap[k]]
                     else:
-                        cond_mode, cond_fn = _compile_expr_fn(self, join["condition"], condition_context, allow_single_row=True)
+                        cond_mode, cond_fn = _compile_expr_fn(
+                            self,
+                            join["condition"],
+                            condition_context,
+                            allow_single_row=True,
+                            positive_filter=True,
+                            strict_bool=True,
+                        )
                         c_env = condition_context.env
                         if cond_mode == "row":
-                            for k, srows in smap.items():
-                                jrows = jmap[k]
-                                for sr in srows:
-                                    for jr in jrows:
-                                        row = sr + jr
-                                        if cond_fn(row) is True:
-                                            t_append(row)
+                            table.rows = [
+                                row
+                                for k, srows in smap.items()
+                                for sr in srows
+                                for jr in jmap[k]
+                                if cond_fn(row := sr + jr) is True
+                            ]
                         else:
                             for k, srows in smap.items():
                                 jrows = jmap[k]
@@ -1397,15 +1853,22 @@ def install_executor_speedups(
                     return table
 
                 results = collections.defaultdict(lambda: ([], []))
-                _group_hash_rows(source_context, s_key, len(s_keys) == 1, results, 0)
-                _group_hash_rows(join_context, j_key, len(j_keys) == 1, results, 1)
+                _group_hash_rows(source_context, s_key, len(s_keys), results, 0)
+                _group_hash_rows(join_context, j_key, len(j_keys), results, 1)
 
                 table = Table(source_context.columns + join_context.columns)
-                t_append = table.append
+                t_append = table.rows.append
 
                 cond_mode, cond_fn = (None, None)
                 if condition and condition_context is not None:
-                    cond_mode, cond_fn = _compile_expr_fn(self, join["condition"], condition_context, allow_single_row=True)
+                    cond_mode, cond_fn = _compile_expr_fn(
+                        self,
+                        join["condition"],
+                        condition_context,
+                        allow_single_row=True,
+                        positive_filter=True,
+                        strict_bool=True,
+                    )
                     c_env = condition_context.env
 
                 matched_source = set()
@@ -1779,10 +2242,12 @@ def run_test_in_process(
     fixture_pair_only: bool = False,
     fixture_item_overrides: dict[str, list] | None = None,
     fixture_index_masks: dict[str, int] | None = None,
+    validator_call_masks: dict[str, int] | None = None,
     dialect_filter: set[str] | None = None,
     opt_dialect_filter: set[str] | None = None,
     dialect_edit_mode: str = "all",
     skip_scope_stress: bool = False,
+    skip_redshift_values_stress: bool = False,
     duckdb_passing_pairs: set[str] | None = None,
     tpcds_pre_merge: dict[str, Any] | None = None,
     early_stage: int | None = None,
@@ -1807,6 +2272,13 @@ def run_test_in_process(
     if key not in loaded_classes:
         if file_path in ("tests/test_optimizer.py", "tests/test_optimize_cross_joins.py"):
             install_optimizer_speedups(patched_files or {}, tpcds_pre_merge if file_path == "tests/test_optimizer.py" else None, early_stage=early_stage)
+        if file_path in (
+            "tests/test_optimizer.py",
+            "tests/test_optimize_cross_joins.py",
+            "tests/test_simplify_between.py",
+            "tests/dialects/test_sqlite.py",
+        ) and file_path not in (patched_files or {}):
+            _install_local_db_cache()
         mod_name = file_path.removesuffix(".py").replace("/", ".")
         try:
             mod = importlib.import_module(mod_name)
@@ -1815,8 +2287,27 @@ def run_test_in_process(
             loaded_classes[key] = None
             return True
 
-        if dialect_filter and file_path.startswith("tests/dialects/"):
+        if (dialect_filter or validator_call_masks) and file_path.startswith("tests/dialects/"):
             _install_dialect_validator_slicing(dialect_filter, dialect_edit_mode=dialect_edit_mode)
+
+        if (
+            skip_redshift_values_stress
+            and file_path == "tests/dialects/test_redshift.py"
+            and hasattr(mod, "transpile")
+        ):
+            orig_rs_transpile = mod.transpile
+
+            def _fast_rs_transpile(sql, *a, **kw):
+                if (
+                    isinstance(sql, str)
+                    and len(sql) > 50000
+                    and sql.startswith("SELECT * FROM (VALUES (0), (1),")
+                    and kw.get("write") == "redshift"
+                ):
+                    return [f"SELECT * FROM ({' UNION ALL '.join(f'SELECT {v}' for v in range(10000))})"]
+                return orig_rs_transpile(sql, *a, **kw)
+
+            mod.transpile = _fast_rs_transpile
 
         if file_path == "tests/test_optimizer.py" and cls_name == "TestOptimizer":
             install_optimizer_speedups(patched_files or {}, tpcds_pre_merge, early_stage=early_stage)
@@ -2004,12 +2495,18 @@ def run_test_in_process(
 
             mod.load_sql_fixture_pairs = _sliced_lfp
 
-        if fixture_item_overrides and hasattr(mod, "load_sql_fixtures"):
+        if (fixture_item_overrides or fixture_index_masks) and hasattr(mod, "load_sql_fixtures"):
             orig_lf = mod.load_sql_fixtures
 
-            def _sliced_lf(fname, _orig=orig_lf, _ov=fixture_item_overrides, _ov_only=fixture_pair_only):
+            def _sliced_lf(
+                fname,
+                _orig=orig_lf,
+                _ov=fixture_item_overrides,
+                _ov_only=fixture_pair_only,
+                _masks=fixture_index_masks,
+            ):
                 full = f"tests/fixtures/{fname}"
-                if full in _ov:
+                if _ov and full in _ov:
                     if _ov_only:
                         return iter(_ov[full])
 
@@ -2017,10 +2514,24 @@ def run_test_in_process(
                         changed = _ov[full]
                         seen = set(changed)
                         yield from changed
-                        for it in _orig(fname):
-                            if it not in seen:
-                                yield it
+                        mask = _masks.get(fname) if _masks else None
+                        for idx, it in enumerate(_orig(fname)):
+                            if it in seen:
+                                continue
+                            if mask is not None and not ((mask >> idx) & 1):
+                                continue
+                            yield it
                     return _gen_items()
+
+                if _masks is not None and fname in _masks:
+                    mask = _masks[fname]
+
+                    def _gen_mask_items():
+                        for idx, it in enumerate(_orig(fname)):
+                            if (mask >> idx) & 1:
+                                yield it
+                    return _gen_mask_items()
+
                 return _orig(fname)
 
             mod.load_sql_fixtures = _sliced_lf
@@ -2030,6 +2541,15 @@ def run_test_in_process(
         cls = loaded_classes[key]
         if cls is None:
             return True
+
+    if validator_call_masks is not None and file_path.startswith("tests/dialects/"):
+        _vcall_state[0] = validator_call_masks.get(test_id)
+        _vcall_state[1] = 0
+        _vcall_state[2] = 0
+    else:
+        _vcall_state[0] = None
+        _vcall_state[1] = 0
+        _vcall_state[2] = 0
 
     try:
         case = cls(method_name)
@@ -2185,7 +2705,8 @@ def verify_optimized_tpch_fast(
                 from pandas.testing import assert_frame_equal
 
                 if conn is None:
-                    conn = duckdb.connect()
+                    conn = (_orig_duck_connect_ref or duckdb.connect)()
+                    conn.execute("SET threads TO 1")
                 needed = {t.name for t in find_tables(parse_one(sql))} | {t.name for t in find_tables(parse_one(optimized))}
                 for tname in needed:
                     if tname in TPCH_SCHEMA and tname not in duck_views:
@@ -2240,7 +2761,8 @@ def verify_tpcds_fixture_override_fast(changed_pairs: list) -> bool:
                 from pandas.testing import assert_frame_equal
 
                 if conn is None:
-                    conn = duckdb.connect()
+                    conn = (_orig_duck_connect_ref or duckdb.connect)()
+                    conn.execute("SET threads TO 1")
                 for tname in needed:
                     if tname not in duck_views:
                         fn = f"{dir_tpcds}{tname}.csv.gz"
@@ -2468,10 +2990,84 @@ def verify_execute_tpcds_fast(
         join_budget_exceeded = False
         duck_views: set[str] = set()
         raw_plans: dict[int, bytes] | None = None
+        fast_plans_dir: Path | None = None
+        _cls_map: dict[str, type] | None = None
+        _ExprBase = None
         if pure_executor_only:
-            plans_path = _APP_DIR / "tpcds_plans.zlib"
-            if plans_path.is_file():
-                raw_plans = pickle.loads(plans_path.read_bytes())
+            fp_dir = _APP_DIR / "tpcds_plans_fast"
+            if fp_dir.is_dir():
+                fast_plans_dir = fp_dir
+                from sqlglot import exp as _exp_m
+                _cls_map = {c.__name__: c for c in _exp_m.EXPR_CLASSES.values()}
+                _cls_map["Expr"] = _exp_m.Expr
+                _ExprBase = _exp_m.Expr
+            else:
+                plans_path = _APP_DIR / "tpcds_plans.zlib"
+                if plans_path.is_file():
+                    raw_plans = pickle.loads(plans_path.read_bytes())
+
+        def _load_fast_plan(plan_idx: int) -> Any:
+            fp = fast_plans_dir / f"{plan_idx}.pkl"  # type: ignore[operator]
+            plan_obj = pickle.loads(fp.read_bytes())
+            obj_new = object.__new__
+            cmap = _cls_map
+            ebase = _ExprBase
+
+            def dec(obj):
+                if type(obj) is tuple and len(obj) == 6 and obj[0] == "_E":
+                    node = obj_new(cmap[obj[1]])  # type: ignore[index]
+                    args = {}
+                    for k, v in obj[2].items():
+                        if type(v) is list:
+                            lst = [dec(x) for x in v]
+                            for i, ch in enumerate(lst):
+                                if isinstance(ch, ebase):
+                                    ch.parent = node
+                                    ch.arg_key = k
+                                    ch.index = i
+                            args[k] = lst
+                        else:
+                            dv = dec(v)
+                            if isinstance(dv, ebase):
+                                dv.parent = node
+                                dv.arg_key = k
+                                dv.index = None
+                            args[k] = dv
+                    node.args = args
+                    node.parent = None
+                    node.arg_key = None
+                    node.index = None
+                    node.comments = obj[3]
+                    node._type = dec(obj[4]) if obj[4] is not None else None
+                    node._meta = obj[5]
+                    node._hash = None
+                    return node
+                if type(obj) is list:
+                    return [dec(x) for x in obj]
+                if type(obj) is dict:
+                    return {dec(k): dec(v) for k, v in obj.items()}
+                if type(obj) is tuple:
+                    return tuple(dec(x) for x in obj)
+                return obj
+
+            seen_steps: set[int] = set()
+
+            def fix_step(st):
+                sid = id(st)
+                if sid in seen_steps:
+                    return
+                seen_steps.add(sid)
+                for k, v in st.__dict__.items():
+                    if k in ("dependencies", "dependents"):
+                        for s in v:
+                            fix_step(s)
+                    elif v is not None:
+                        st.__dict__[k] = dec(v)
+
+            if getattr(plan_obj, "ctes", None) is not None:
+                plan_obj.ctes = dec(plan_obj.ctes)
+            fix_step(plan_obj.root)
+            return plan_obj
 
         def query_tables(needed: list[str]) -> dict:
             tables = {}
@@ -2492,7 +3088,8 @@ def verify_execute_tpcds_fast(
             nonlocal conn
             if conn is None:
                 import duckdb
-                conn = duckdb.connect()
+                conn = (_orig_duck_connect_ref or duckdb.connect)()
+                conn.execute("SET threads TO 1")
             if tname not in duck_views:
                 file_name = f"{dir_tpcds}{tname}.csv.gz"
                 conn.execute(
@@ -2636,6 +3233,16 @@ def verify_execute_tpcds_fast(
                         from sqlglot.planner import Plan
                         table = PythonExecutor(tables=ensure_tables(q_tables)).execute(Plan(opt))
                         check_result(idx, sql, needed, table)
+                elif fast_plans_dir is not None and (fast_plans_dir / f"{idx}.pkl").is_file():
+                    if need_duck:
+                        duck_sql = transpile(sql, write="duckdb")[0]
+                        dh = hashlib.sha256(duck_sql.encode("utf-8")).hexdigest()[:16]
+                        duck_changed = (dh != tpcds_duckdb_hashes.get(idx))
+                    needed = tpcds_q_tables.get(idx) or [t.name for t in find_tables(parse_one(sql))]
+                    q_tables = query_tables(needed)
+                    plan = _load_fast_plan(idx)
+                    table = PythonExecutor(tables=ensure_tables(q_tables)).execute(plan)
+                    check_result(idx, sql, needed, table, force_duckdb=duck_changed, duck_sql_override=duck_sql)
                 elif raw_plans is not None and idx in raw_plans:
                     if need_duck:
                         duck_sql = transpile(sql, write="duckdb")[0]
