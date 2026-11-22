@@ -72,8 +72,17 @@ def _exact_pack(items: list[tuple[int, int]], k: int, ub: int, lb: int, max_node
 
 def pack_workers(test_nums: list[int] | set[int], dur_ms_map: dict[int, int]) -> list[list[int]]:
     """Return optimal worker assignment minimizing max(worker_load) + 2000 * k."""
+    return _pack(test_nums, dur_ms_map)[0]
+
+
+def pack_cost_ms(test_nums: list[int] | set[int], dur_ms_map: dict[int, int]) -> int:
+    """Return the simulated cost of the assignment produced by pack_workers."""
+    return _pack(test_nums, dur_ms_map)[1]
+
+
+def _pack(test_nums: list[int] | set[int], dur_ms_map: dict[int, int]) -> tuple[list[list[int]], int]:
     if not test_nums:
-        return []
+        return [], 0
     items = sorted(((dur_ms_map[n], n) for n in test_nums), reverse=True)
     total = sum(d for d, _ in items)
     max_d = items[0][0]
@@ -101,4 +110,5 @@ def pack_workers(test_nums: list[int] | set[int], dur_ms_map: dict[int, int]) ->
                     best_cost = em + WORKER_COST_MS * k
                     best_bins = ebins
 
-    return [b for b in best_bins if b]
+    nonempty_bins = [b for b in best_bins if b]
+    return nonempty_bins, best_cost - WORKER_COST_MS * (len(best_bins) - len(nonempty_bins))

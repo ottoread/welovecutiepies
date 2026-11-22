@@ -225,6 +225,11 @@ class PyEditInfo:
     scope_changed_funcs: set[str] = field(default_factory=set)
     # Raw orig changed lines
     orig_changed_lines: set[int] = field(default_factory=set)
+    # Dict-key diffs for class/module dict assignments: "Scope:ATTR" -> (changed_key_tags_or_None, keys_added_or_removed)
+    dict_key_edits: dict[str, tuple[set[str] | None, bool]] = field(default_factory=dict)
+    # If ONLY private module-level constant assignment(s) changed, exact lines & func entries inside functions reading them
+    const_reader_lines: set[int] | None = None
+    const_reader_func_entries: set[int] = field(default_factory=set)
 
 
 def _node_span(node: ast.AST) -> tuple[int, int]:
@@ -551,7 +556,211 @@ def analyze_python_edit(
     if not info.stmt_lines and not info.enclosing_funcs and not info.class_level_edits:
         info.module_level_edit = True
 
+    # Dict-key diffing for edited class attributes and module-level dict assignments!
+    _analyze_dict_key_edits(orig_ast, new_ast, info)
+
+    # Module-level constant-to-reader propagation (when ONLY simple module-level assignments changed!)
+    if (
+        info.module_level_edit
+        and info.module_level_names
+        and not info.class_level_edits
+        and not info.enclosing_funcs
+    ):
+        _analyze_const_readers(orig_ast, new_ast, info, _first_exec_line)
+
     return info
+
+
+def _extract_dict_key_tag(k: ast.AST) -> str | None:
+    if isinstance(k, ast.Constant) and isinstance(k.value, str):
+        return f"str:{k.value}"
+    if isinstance(k, ast.Attribute):
+        # exp.Abs -> "exp:Abs", exp.DType.BOOLEAN -> "dtype:BOOLEAN", exp.DataType.Type.BOOLEAN -> "dtype:BOOLEAN"
+        if isinstance(k.value, ast.Name) and k.value.id == "exp":
+            return f"exp:{k.attr}"
+        if (
+            isinstance(k.value, ast.Attribute)
+            and k.value.attr == "DType"
+            and isinstance(k.value.value, ast.Name)
+            and k.value.value.id == "exp"
+        ):
+            return f"dtype:{k.attr}"
+        if (
+            isinstance(k.value, ast.Attribute)
+            and k.value.attr == "Type"
+            and isinstance(k.value.value, ast.Attribute)
+            and k.value.value.attr == "DataType"
+        ):
+            return f"dtype:{k.attr}"
+    return None
+
+
+def _diff_dict_nodes(orig_d: ast.Dict, new_d: ast.Dict) -> tuple[set[str] | None, bool]:
+    orig_spreads = [ast.dump(v, include_attributes=False) for k, v in zip(orig_d.keys, orig_d.values) if k is None]
+    new_spreads = [ast.dump(v, include_attributes=False) for k, v in zip(new_d.keys, new_d.values) if k is None]
+    if orig_spreads != new_spreads:
+        return None, True
+
+    orig_map: dict[str, tuple[ast.AST, str]] = {}
+    for k, v in zip(orig_d.keys, orig_d.values):
+        if k is None:
+            continue
+        kd = ast.dump(k, include_attributes=False)
+        if kd in orig_map:
+            return None, True
+        orig_map[kd] = (k, ast.dump(v, include_attributes=False))
+
+    new_map: dict[str, tuple[ast.AST, str]] = {}
+    for k, v in zip(new_d.keys, new_d.values):
+        if k is None:
+            continue
+        kd = ast.dump(k, include_attributes=False)
+        if kd in new_map:
+            return None, True
+        new_map[kd] = (k, ast.dump(v, include_attributes=False))
+
+    keys_added_or_removed = set(orig_map.keys()) != set(new_map.keys())
+    tags: set[str] = set()
+    for kd in set(orig_map.keys()) | set(new_map.keys()):
+        ov = orig_map.get(kd)
+        nv = new_map.get(kd)
+        if ov is None or nv is None or ov[1] != nv[1]:
+            k_node = nv[0] if nv is not None else ov[0]
+            tag = _extract_dict_key_tag(k_node)
+            if tag is None:
+                return None, keys_added_or_removed
+            tags.add(tag)
+    return tags, keys_added_or_removed
+
+
+def _index_dict_assigns(tree: ast.AST) -> dict[str, ast.Dict]:
+    out: dict[str, ast.Dict] = {}
+
+    def walk(body: list[ast.stmt], cls_prefix: str) -> None:
+        for stmt in body:
+            if isinstance(stmt, ast.ClassDef):
+                qn = f"{cls_prefix}.{stmt.name}" if cls_prefix else stmt.name
+                walk(stmt.body, qn)
+            elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Dict) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                key = f"{cls_prefix or '__module__'}:{stmt.targets[0].id}"
+                out[key] = stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.value, ast.Dict) and isinstance(stmt.target, ast.Name):
+                key = f"{cls_prefix or '__module__'}:{stmt.target.id}"
+                out[key] = stmt.value
+
+    walk(getattr(tree, "body", []), "")
+    return out
+
+
+def _analyze_dict_key_edits(orig_ast: ast.AST, new_ast: ast.AST, info: PyEditInfo) -> None:
+    targets: list[str] = []
+    for cname, attrs in info.class_attr_edits.items():
+        if cname not in info.class_non_attr_edits:
+            for a in attrs:
+                targets.append(f"{cname}:{a}")
+    if info.module_level_edit and info.module_level_names:
+        for nm in info.module_level_names:
+            targets.append(f"__module__:{nm}")
+    if not targets:
+        return
+    orig_dicts = _index_dict_assigns(orig_ast)
+    new_dicts = _index_dict_assigns(new_ast)
+    for tkey in targets:
+        od = orig_dicts.get(tkey)
+        nd = new_dicts.get(tkey)
+        if od is not None and nd is not None:
+            info.dict_key_edits[tkey] = _diff_dict_nodes(od, nd)
+
+
+def _simple_assign_names(stmt: ast.stmt) -> set[str] | None:
+    if isinstance(stmt, ast.Assign) and all(isinstance(t, ast.Name) for t in stmt.targets):
+        return {t.id for t in stmt.targets}
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+        return {stmt.target.id}
+    return None
+
+
+def _analyze_const_readers(
+    orig_ast: ast.Module,
+    new_ast: ast.Module,
+    info: PyEditInfo,
+    first_exec_fn,
+) -> None:
+    """If the ONLY difference between orig_ast and new_ast is value(s) of simple module-level
+    assignments `X = ...` that are NOT read at module/class top level and NOT in `__all__`,
+    collect the exact lines & function entry lines where `X` is read inside function bodies."""
+    if len(orig_ast.body) != len(new_ast.body):
+        return
+    edited_names: set[str] = set()
+    edited_indices: set[int] = set()
+    for i, (os_stmt, ns_stmt) in enumerate(zip(orig_ast.body, new_ast.body)):
+        if ast.dump(os_stmt, include_attributes=False) == ast.dump(ns_stmt, include_attributes=False):
+            continue
+        on = _simple_assign_names(os_stmt)
+        nn = _simple_assign_names(ns_stmt)
+        if not on or on != nn:
+            return
+        edited_names.update(on)
+        edited_indices.add(i)
+
+    if not edited_names or "__all__" in edited_names:
+        return
+
+    # Check if any edited name is exported in __all__ or read outside function bodies
+    for i, stmt in enumerate(orig_ast.body):
+        if i in edited_indices:
+            continue
+        if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
+            for node in ast.walk(stmt.value):
+                if isinstance(node, ast.Constant) and node.value in edited_names:
+                    return
+        # Check non-function code (module-level statements & class bodies outside methods)
+        if _reads_name_outside_funcs(stmt, edited_names):
+            return
+
+    # Collect every line inside function/method bodies reading any of edited_names
+    reader_lines: set[int] = set()
+    reader_entries: set[int] = set()
+
+    def scan_funcs(body: list[ast.stmt]) -> None:
+        for stmt in body:
+            if isinstance(stmt, ast.ClassDef):
+                scan_funcs(stmt.body)
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                found = False
+                for node in ast.walk(stmt):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in edited_names:
+                        ln = getattr(node, "lineno", 0)
+                        if ln:
+                            reader_lines.add(ln)
+                            found = True
+                if found:
+                    fl = first_exec_fn(stmt)
+                    if fl is not None:
+                        reader_entries.add(fl)
+
+    scan_funcs(orig_ast.body)
+    if reader_lines:
+        info.const_reader_lines = reader_lines
+        info.const_reader_func_entries = reader_entries
+
+
+def _reads_name_outside_funcs(node: ast.AST, names: set[str]) -> bool:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # Decorators & default args execute at class/module definition time!
+        for d in node.decorator_list:
+            if _reads_name_outside_funcs(d, names):
+                return True
+        for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+            if _reads_name_outside_funcs(d, names):
+                return True
+        return False
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in names:
+        return True
+    for child in ast.iter_child_nodes(node):
+        if _reads_name_outside_funcs(child, names):
+            return True
+    return False
 
 
 def _find_enclosing_lambda(node: ast.AST, hit_lines: list[int]) -> ast.Lambda | None:

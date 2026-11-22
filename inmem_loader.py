@@ -572,13 +572,21 @@ class _EarlyVerifiedAST:
         raise RuntimeError("Unexpected sql() arguments on _EarlyVerifiedAST")
 
 
+# Set per job in the forked verifier before any executor tests run.
+EXECUTOR_OPTIONS: dict[str, bool] = {}
+
+
 def install_executor_speedups(
     patched_files: dict[str, str | None],
     allow_lambda_exec: bool = False,
 ) -> None:
-    """Install 100% sound runtime speedups on unpatched executor/table.py and executor/python.py."""
+    """Install executor speedups when the patch leaves their dependencies intact."""
+    table_patched = "sqlglot/executor/table.py" in patched_files
+    context_patched = "sqlglot/executor/context.py" in patched_files
+    python_patched = "sqlglot/executor/python.py" in patched_files
+    context_table_only = EXECUTOR_OPTIONS.get("context_table_only", False)
     try:
-        if "sqlglot/executor/table.py" not in patched_files:
+        if not (table_patched or python_patched or context_patched):
             import sqlglot.executor.table as tbl_mod
 
             if not getattr(tbl_mod.Table, "_br_iter_patched", False):
@@ -594,9 +602,9 @@ def install_executor_speedups(
 
         if (
             allow_lambda_exec
-            and "sqlglot/executor/python.py" not in patched_files
+            and not (python_patched or table_patched)
             and "sqlglot/generators/python.py" not in patched_files
-            and "sqlglot/executor/table.py" not in patched_files
+            and (not context_patched or context_table_only)
         ):
             import sqlglot.executor.python as py_mod
 
@@ -606,8 +614,46 @@ def install_executor_speedups(
             PythonExecutor._br_exec_patched = True
 
             Table = py_mod.Table
+            Context = py_mod.Context
+            table_getitem = Table.__getitem__
+            direct_iteration = (
+                EXECUTOR_OPTIONS.get("direct_iteration", False)
+                and not any(
+                    path in patched_files
+                    for path in (
+                        "sqlglot/executor/__init__.py",
+                        "sqlglot/executor/env.py",
+                        "tests/helpers.py",
+                        "tests/test_executor.py",
+                    )
+                )
+            )
             ENV_MOD = py_mod.ENV
             shared_gen = py_mod.Python().generator(identify=True, comments=False)
+
+            def _fast_context_iter(self):
+                self.env["scope"] = self.row_readers
+                # Keep the table property call, including its validation and any patched behavior.
+                table = self.table
+                tables = self.tables
+                count = len(table.rows)
+                if (
+                    type(self) is Context
+                    and type(tables) is dict
+                    and len(tables) == 1
+                    and type(table) is Table
+                    and Table.__getitem__ is table_getitem
+                    and next(iter(tables.values())) is table
+                ):
+                    for index in range(count):
+                        reader = table.reader
+                        reader.row = table.rows[index]
+                        yield reader, self
+                else:
+                    for index in range(count):
+                        for item in self.tables.values():
+                            reader = item[index]
+                        yield reader, self
 
             def _fast_init(self, env=None, tables=None):
                 self.generator = shared_gen
@@ -661,15 +707,12 @@ def install_executor_speedups(
                             if cond_fn(sc):
                                 sink_append(proj_fn(sc))
                     else:
-                        checked = False
                         for reader in table_iter:
                             if len(sink_rows) >= limit:
                                 break
                             if cond_fn(c_env["scope"]):
                                 row = reader.row
-                                if not checked:
-                                    assert len(row) == sink_width
-                                    checked = True
+                                assert len(row) == sink_width
                                 sink_append(row)
                 else:
                     if proj_fn is not None:
@@ -678,50 +721,67 @@ def install_executor_speedups(
                                 break
                             sink_append(proj_fn(c_env["scope"]))
                     else:
-                        checked = False
                         for reader in table_iter:
                             if len(sink_rows) >= limit:
                                 break
                             row = reader.row
-                            if not checked:
-                                assert len(row) == sink_width
-                                checked = True
+                            assert len(row) == sink_width
                             sink_append(row)
                 return sink
+
+            def _compile_hash_key(self, expressions, context):
+                if (
+                    direct_iteration
+                    and not context_patched
+                    and len(expressions) == 1
+                    and type(context) is Context
+                ):
+                    expr = expressions[0]
+                    if type(expr) is py_mod.exp.Column and len(context.tables) == 1:
+                        alias, table = next(iter(context.tables.items()))
+                        reader = context.row_readers.get(alias)
+                        if (
+                            type(table) is Table
+                            and type(reader) is py_mod.RowReader
+                            and reader is table.reader
+                            and expr.name in reader.columns
+                            and self.generator.generate(expr) == f"scope[{alias!r}][{expr.name!r}]"
+                        ):
+                            return None, reader.columns[expr.name]
+                return _compile_tuple_lambda(self, expressions, context.env), None
+
+            def _group_hash_rows(context, compiled, single_key, results, side):
+                key_fn, column_index = compiled
+                if column_index is not None:
+                    for index, (reader, _) in enumerate(context):
+                        row = reader.row
+                        value = row[column_index]
+                        if value is not None:
+                            results[(value,)][side].append((index, row))
+                elif single_key:
+                    env = context.env
+                    for index, (reader, _) in enumerate(context):
+                        key = key_fn(env["scope"])
+                        if key[0] is not None:
+                            results[key][side].append((index, reader.row))
+                else:
+                    env = context.env
+                    for index, (reader, _) in enumerate(context):
+                        key = key_fn(env["scope"])
+                        if all(v is not None for v in key):
+                            results[key][side].append((index, reader.row))
 
             def _fast_hash_join(self, join, source_context, join_context, condition, condition_context):
                 s_keys = join["source_key"]
                 j_keys = join["join_key"]
-                s_fn = _compile_tuple_lambda(self, s_keys, source_context.env)
-                j_fn = _compile_tuple_lambda(self, j_keys, join_context.env)
+                s_key = _compile_hash_key(self, s_keys, source_context)
+                j_key = _compile_hash_key(self, j_keys, join_context)
                 results = collections.defaultdict(lambda: ([], []))
-                s_env = source_context.env
-                j_env = join_context.env
-
-                if len(s_keys) == 1:
-                    for index, (reader, ctx) in enumerate(source_context):
-                        key = s_fn(s_env["scope"])
-                        if key[0] is not None:
-                            results[key][0].append((index, reader.row))
-                else:
-                    for index, (reader, ctx) in enumerate(source_context):
-                        key = s_fn(s_env["scope"])
-                        if all(v is not None for v in key):
-                            results[key][0].append((index, reader.row))
-
-                if len(j_keys) == 1:
-                    for index, (reader, ctx) in enumerate(join_context):
-                        key = j_fn(j_env["scope"])
-                        if key[0] is not None:
-                            results[key][1].append((index, reader.row))
-                else:
-                    for index, (reader, ctx) in enumerate(join_context):
-                        key = j_fn(j_env["scope"])
-                        if all(v is not None for v in key):
-                            results[key][1].append((index, reader.row))
+                _group_hash_rows(source_context, s_key, len(s_keys) == 1, results, 0)
+                _group_hash_rows(join_context, j_key, len(j_keys) == 1, results, 1)
 
                 table = Table(source_context.columns + join_context.columns)
-                t_append = table.rows.append
+                t_append = table.append
                 side = join.get("side")
 
                 if not condition and not side:
@@ -844,6 +904,8 @@ def install_executor_speedups(
             PythonExecutor._project_and_filter = _fast_project_and_filter
             PythonExecutor.hash_join = _fast_hash_join
             PythonExecutor.aggregate = _fast_aggregate
+            if direct_iteration:
+                Context.__iter__ = _fast_context_iter
     except BaseException:
         pass
 

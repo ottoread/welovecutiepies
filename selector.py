@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from inmem_loader import (
+    EXECUTOR_OPTIONS,
     install_overlay,
     run_test_in_process,
     verify_execute_tpcds_fast,
@@ -26,7 +27,7 @@ from patch_utils import (
     diff_sql_fixtures,
     parse_patch,
 )
-from worker_pack import duration_ms, pack_workers
+from worker_pack import WORKER_COST_MS, duration_ms, pack_cost_ms, pack_workers
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 SQLGLOT_ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/app/sqlglot")).resolve()
@@ -144,7 +145,9 @@ def _alarm_handler(signum, frame):
     raise _TestTimeout()
 
 
-def _execute_job_in_child(job: dict, is_tier0: bool) -> tuple[str, Any]:
+def _execute_job_in_child(
+    job: dict, is_tier0: bool
+) -> tuple[str, list[str], float] | tuple[str, list[int], float, list[tuple[str, float]]]:
     """Run inside a freshly forked leaf process with stdout/stderr silenced."""
     _silence_stdout_and_stderr_in_child()
     signal.signal(signal.SIGALRM, _alarm_handler)
@@ -155,6 +158,10 @@ def _execute_job_in_child(job: dict, is_tier0: bool) -> tuple[str, Any]:
 
     patched_files: dict[str, str | None] = job["patched_files"]
     install_overlay(SQLGLOT_ROOT, patched_files)
+    EXECUTOR_OPTIONS.update(
+        direct_iteration=job.get("allow_direct_iteration", False),
+        context_table_only=job.get("context_table_only", False),
+    )
 
     test_items: list[tuple[int, str]] = list(job["tests"])
     failing: list[int] = []
@@ -191,7 +198,7 @@ def _execute_job_in_child(job: dict, is_tier0: bool) -> tuple[str, Any]:
             finally:
                 signal.setitimer(signal.ITIMER_REAL, 0)
         if broken_rels:
-            return ("import_err", broken_rels)
+            return ("import_err", broken_rels, time.process_time())
 
     serde_touched: bool = job["serde_touched"]
     fixture_pair_ov: dict[str, list] | None = job.get("fixture_pair_overrides")
@@ -207,23 +214,25 @@ def _execute_job_in_child(job: dict, is_tier0: bool) -> tuple[str, Any]:
     early_stage: int | None = job.get("early_stage")
     allow_lambda_exec: bool = job.get("allow_lambda_exec", False)
     dur_ms_map: dict[int, int] = job.get("dur_ms_map", {})
+    verification_cpu_ms: dict[int, float] = job.get("verification_cpu_ms", {})
+    auto_include: set[int] = job.get("auto_include", set())
     per_commit_cpu_cap: float = job.get("cpu_cap", 25.0)
 
     loaded_classes: dict[tuple[str, str], Any] = {}
     t_cpu0 = time.process_time()
 
-    # Always move TEST_EXECUTE_TPCDS to the very end so fast tests never get starved of CPU budget!
     exec_items = [x for x in test_items if x[1] == TEST_EXECUTE_TPCDS]
-    if exec_items:
-        test_items = [x for x in test_items if x[1] != TEST_EXECUTE_TPCDS] + exec_items
-
-    # If both test_tpcds and test_execute_tpcds (optimizer-mode) are in test_items,
-    # share the post-rule-6 AST cache between them!
+    opt_items = [
+        x for x in test_items if x[1] == "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+    ]
     tpcds_pre_merge: dict[str, Any] | None = None
-    TEST_OPT_TPCDS = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
-    has_opt_tpcds = any(tid == TEST_OPT_TPCDS for _, tid in test_items)
-    has_exec_tpcds = tpcds_fast is not None and not tpcds_fast["executor_touched"] and bool(exec_items)
-    if has_opt_tpcds and has_exec_tpcds and "sqlglot/optimizer/optimizer.py" not in patched_files:
+    share_tpcds = (
+        bool(opt_items and exec_items)
+        and tpcds_fast is not None
+        and not tpcds_fast["executor_touched"]
+        and "sqlglot/optimizer/optimizer.py" not in patched_files
+    )
+    if share_tpcds:
         try:
             from tests.helpers import load_sql_fixture_pairs
             wanted = {
@@ -235,11 +244,38 @@ def _execute_job_in_child(job: dict, is_tier0: bool) -> tuple[str, Any]:
         except BaseException:
             tpcds_pre_merge = None
 
+    if exec_items:
+        # Resolve the expensive test early when it has a fast verifier, preserving its cache dependency.
+        if tpcds_fast is not None:
+            front = (opt_items if tpcds_pre_merge is not None else []) + exec_items
+            front_nums = {n for n, _ in front}
+            test_items = front + [x for x in test_items if x[0] not in front_nums]
+        else:
+            test_items = [x for x in test_items if x[1] != TEST_EXECUTE_TPCDS] + exec_items
+
+    remaining = {n for n, _ in test_items}
+    remaining_cpu_ms = sum(verification_cpu_ms.get(n, 0.0) for n in remaining)
+    have_anchor = any(dur_ms_map.get(n, 0) >= WORKER_COST_MS for n in auto_include | set(failing))
+    next_pack_check = 0
+    timings: list[tuple[str, float]] = []
     for idx, (tnum, tid) in enumerate(test_items):
-        if idx > 0 and (time.process_time() - t_cpu0) > per_commit_cpu_cap:
-            for rem_num, _ in test_items[idx:]:
-                failing.append(rem_num)
+        test_cpu_start = time.process_time()
+        if idx > 0 and (test_cpu_start - t_cpu0) > per_commit_cpu_cap:
+            failing.extend(remaining)
             break
+
+        if have_anchor and verification_cpu_ms and idx >= next_pack_check:
+            required = auto_include.union(failing)
+            savings_ms = pack_cost_ms(required | remaining, dur_ms_map) - pack_cost_ms(required, dur_ms_map)
+            if savings_ms < remaining_cpu_ms:
+                # Keep every unchecked candidate, including any undiscovered failures.
+                failing.extend(remaining)
+                break
+            next_pack_check = idx + 16
+
+        remaining.remove(tnum)
+        remaining_cpu_ms -= verification_cpu_ms.get(tnum, 0.0)
+        prior_failures = len(failing)
 
         # Per-test infinite-loop protection via SIGALRM (timeout = test failure, matching pytest-timeout!)
         rec_s = dur_ms_map.get(tnum, 500) / 1000.0
@@ -305,8 +341,12 @@ def _execute_job_in_child(job: dict, is_tier0: bool) -> tuple[str, Any]:
             failing.append(tnum)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
+            timings.append((tid, round(time.process_time() - test_cpu_start, 3)))
+            if len(failing) > prior_failures and dur_ms_map.get(tnum, 0) >= WORKER_COST_MS:
+                have_anchor = True
+                next_pack_check = idx + 1
 
-    return ("ok", failing)
+    return ("ok", failing, time.process_time(), timings)
 
 
 def _verify_generator_memory_subset(dialect_names: list[str]) -> bool:
@@ -346,6 +386,8 @@ class ForkRunner:
         self.t1_rep_r: int | None = None
         self.t1_loaded_files: set[str] = set(DEFAULT_CORE_FILES)
         self._heavy_preloaded = False
+        self.child_cpu_total = 0.0
+        self.last_timings = None
 
     def _ensure_heavy_third_party(self) -> None:
         """Pre-import numpy, pandas, duckdb ONCE in parent (verified OS num_threads == 1)."""
@@ -438,8 +480,11 @@ class ForkRunner:
                 assert self.t1_req_w is not None and self.t1_rep_r is not None
                 _send_msg(self.t1_req_w, job)
                 msg = _recv_msg(self.t1_rep_r)
+                if msg and len(msg) > 2:
+                    self.child_cpu_total += msg[2]
+                    self.last_timings = msg[3] if len(msg) > 3 else None
                 if msg and msg[0] in ("ok", "import_err"):
-                    return msg
+                    return msg[0], msg[1]
                 return ("ok", [n for n, _ in job["tests"]])
 
         self._ensure_heavy_third_party()
@@ -464,8 +509,11 @@ class ForkRunner:
             msg = _recv_msg(c_r)
             os.close(c_r)
             os.waitpid(cpid, 0)
+            if msg and len(msg) > 2:
+                self.child_cpu_total += msg[2]
+                self.last_timings = msg[3] if len(msg) > 3 else None
             if msg and msg[0] in ("ok", "import_err"):
-                return msg
+                return msg[0], msg[1]
             return ("ok", [n for n, _ in job["tests"]])
 
     def close(self) -> None:
@@ -632,6 +680,7 @@ class BlastRadiusSelector:
         tpcds_exec_affected_qs: set[int] | None = set()
         touched_dialect_names: set[str] | None = set()
         allow_lambda_exec = True
+        context_table_only = False
 
         # Track whether per-fixture-index bitmask slicing is 100% sound for this commit!
         can_slice_fixtures = True
@@ -738,6 +787,12 @@ class BlastRadiusSelector:
             if rel in ("sqlglot/executor/python.py", "sqlglot/generators/python.py", "sqlglot/executor/table.py"):
                 allow_lambda_exec = False
             elif rel == "sqlglot/executor/context.py":
+                context_table_only = (
+                    edit.enclosing_funcs == {"Context.table"}
+                    and not edit.class_level_edits
+                    and not edit.module_level_edit
+                    and not edit.scope_changed_funcs
+                )
                 if (
                     edit.class_level_edits
                     or edit.module_level_edit
@@ -1065,28 +1120,26 @@ class BlastRadiusSelector:
             else:
                 normal_cands.append(n)
 
+        verification_cpu_ms: dict[int, float] = {}
+        for n in candidates - auto_include:
+            file = self.by_num[n]["file"]
+            if n == self.tpcds_num:
+                ratio = 0.35 if tpcds_fast_arg is not None else 0.85
+            elif n == self.tpch_num and tpch_fast_arg:
+                ratio = 0.35
+            elif n == self.gen_mem_num and gen_mem_dialects_arg is not None:
+                ratio = 0.20
+            elif file == "tests/test_optimizer.py":
+                ratio = 0.10 if (dialect_filter or fixture_index_masks) else 0.35
+            elif file.startswith("tests/dialects/") and dialect_filter:
+                ratio = 0.20
+            else:
+                ratio = 0.90
+            verification_cpu_ms[n] = max(1.0, self.dur_ms[n] * ratio)
+
         if normal_cands:
-            est_cpu_ms = 0.0
-            for n in normal_cands:
-                d = self.dur_ms[n]
-                f = self.by_num[n]["file"]
-                if f == "tests/test_optimizer.py":
-                    est_cpu_ms += d * (0.10 if (dialect_filter or fixture_index_masks) else 0.35)
-                elif f.startswith("tests/dialects/") and dialect_filter:
-                    est_cpu_ms += d * 0.20
-                elif n == self.tpcds_num:
-                    est_cpu_ms += d * 0.85
-                else:
-                    est_cpu_ms += d * 0.90
-            est_cpu_ms += 40.0
-
-            sim_pack = pack_workers(normal_cands, self.dur_ms)
-            sim_cost_ms = (
-                max(sum(self.dur_ms[n] for n in w) for w in sim_pack) + 2000 * len(sim_pack)
-                if sim_pack
-                else 0
-            )
-
+            est_cpu_ms = sum(verification_cpu_ms[n] for n in normal_cands) + 40.0
+            sim_cost_ms = pack_cost_ms(normal_cands, self.dur_ms)
             if len(normal_cands) <= 1200 and (est_cpu_ms < sim_cost_ms * 0.92 or est_cpu_ms <= 5500):
                 for n in sorted(normal_cands, key=lambda x: self.dur_ms[x]):
                     verify_list.append((n, self.by_num[n]["id"]))
@@ -1146,8 +1199,12 @@ class BlastRadiusSelector:
                 "gen_mem_dialects": gen_mem_dialects_arg,
                 "early_stage": early_stage,
                 "allow_lambda_exec": allow_lambda_exec,
+                "allow_direct_iteration": allow_lambda_exec,
+                "context_table_only": context_table_only,
                 "tests": verify_list,
-                "dur_ms_map": {n: self.dur_ms[n] for n, _ in verify_list},
+                "dur_ms_map": {n: self.dur_ms[n] for n in candidates},
+                "verification_cpu_ms": verification_cpu_ms,
+                "auto_include": auto_include,
                 "cpu_cap": 25.0,
             }
             status, payload = self.runner.run_job(job, need_tier0=need_tier0)
